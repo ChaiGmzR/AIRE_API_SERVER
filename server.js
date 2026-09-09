@@ -1,3 +1,9 @@
+const fs = require('fs');
+const path = require('path');
+const { spawnSync } = require('child_process');
+
+ensureDependencies();
+
 const express = require('express');
 const cors = require('cors');
 require('dotenv').config();
@@ -115,3 +121,51 @@ function parsePort(value, fallback) {
 }
 
 startServer();
+
+function ensureDependencies() {
+    if (process.env.AUTO_INSTALL_DEPENDENCIES === 'false') {
+        return;
+    }
+
+    const packageJsonPath = path.join(__dirname, 'package.json');
+    if (!fs.existsSync(packageJsonPath)) {
+        throw new Error(`package.json not found at ${packageJsonPath}`);
+    }
+
+    const packageJson = JSON.parse(fs.readFileSync(packageJsonPath, 'utf8'));
+    const dependencies = Object.keys(packageJson.dependencies || {});
+    const missing = dependencies.filter((dependency) => {
+        try {
+            require.resolve(dependency, { paths: [__dirname] });
+            return false;
+        } catch (_) {
+            return true;
+        }
+    });
+
+    if (missing.length === 0) {
+        return;
+    }
+
+    console.log(`Installing missing dependencies: ${missing.join(', ')}`);
+
+    const npmCommand = process.platform === 'win32'
+        ? process.env.ComSpec || 'cmd.exe'
+        : 'npm';
+    const npmArgs = process.platform === 'win32'
+        ? ['/d', '/s', '/c', 'npm install --omit=dev']
+        : ['install', '--omit=dev'];
+    const result = spawnSync(npmCommand, npmArgs, {
+        cwd: __dirname,
+        stdio: 'inherit',
+        env: process.env
+    });
+
+    if (result.error) {
+        throw result.error;
+    }
+
+    if (result.status !== 0) {
+        throw new Error(`npm install failed with exit code ${result.status}`);
+    }
+}
