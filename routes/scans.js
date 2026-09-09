@@ -2,7 +2,7 @@ const express = require('express');
 const { constants } = require('fs');
 const fs = require('fs/promises');
 const path = require('path');
-const { testConnection } = require('../db');
+const { query, testConnection } = require('../db');
 const { extractPartNumber, validateBoxId, validateBarCode } = require('../utils/partNumber');
 const { getShiftTimeRange, formatDateTime } = require('../utils/shifts');
 
@@ -34,12 +34,26 @@ router.post('/', async (req, res) => {
             return res.status(400).json({ error: barcodeValidation.error });
         }
 
-        const boxScans = getOrCreateBox(boxValidation.boxId);
-        const duplicate = boxScans.some(scan => scan.serial === barcodeValidation.barcode);
+        const existingBoxScans = pendingBoxes.get(boxValidation.boxId) || [];
+        const duplicate = existingBoxScans.some(scan => scan.serial === barcodeValidation.barcode);
         if (duplicate) {
             return res.status(409).json({ error: 'Barcode already scanned in this box' });
         }
 
+        const partValidation = validateBoxPartNumber(existingBoxScans, barcodeValidation.partNumber);
+        if (!partValidation.valid) {
+            return res.status(409).json({ error: partValidation.error });
+        }
+
+        const testStatus = await validateQualityStatus(barcodeValidation.barcode);
+        if (!testStatus.valid) {
+            return res.status(409).json({
+                error: testStatus.error,
+                quality: testStatus.quality
+            });
+        }
+
+        const boxScans = getOrCreateBox(boxValidation.boxId);
         const now = new Date();
         const scan = {
             id: boxScans.length + 1,
@@ -214,6 +228,80 @@ function getOrCreateBox(boxCode) {
         pendingBoxes.set(boxCode, []);
     }
     return pendingBoxes.get(boxCode);
+}
+
+function validateBoxPartNumber(boxScans, partNumber) {
+    if (boxScans.length === 0) {
+        return { valid: true };
+    }
+
+    const expectedPartNumber = boxScans[0].partNumber;
+    if (expectedPartNumber === partNumber) {
+        return { valid: true };
+    }
+
+    return {
+        valid: false,
+        error: `Part number mismatch. Expected ${expectedPartNumber}, got ${partNumber}`
+    };
+}
+
+async function validateQualityStatus(barcode) {
+    const [ictRows, fctRows] = await Promise.all([
+        query(
+            `SELECT resultado, ts
+             FROM history_ict
+             WHERE barcode = ?
+             ORDER BY ts DESC
+             LIMIT 1`,
+            [barcode]
+        ),
+        query(
+            `SELECT result, COALESCE(test_ts, TIMESTAMP(fecha, hora)) AS test_ts
+             FROM history_fct
+             WHERE barcode = ?
+             ORDER BY COALESCE(test_ts, TIMESTAMP(fecha, hora)) DESC
+             LIMIT 1`,
+            [barcode]
+        )
+    ]);
+
+    const ict = ictRows[0] || null;
+    const fct = fctRows[0] || null;
+    const quality = {
+        ict: {
+            found: Boolean(ict),
+            status: ict?.resultado || null,
+            timestamp: ict?.ts || null
+        },
+        fct: {
+            found: Boolean(fct),
+            status: fct?.result || null,
+            timestamp: fct?.test_ts || null
+        }
+    };
+
+    if (!ict) {
+        return { valid: false, error: 'ICT status not found for this barcode', quality };
+    }
+
+    if (normalizeStatus(ict.resultado) !== 'OK') {
+        return { valid: false, error: `ICT status must be OK. Current status: ${ict.resultado}`, quality };
+    }
+
+    if (!fct) {
+        return { valid: false, error: 'FCT status not found for this barcode', quality };
+    }
+
+    if (normalizeStatus(fct.result) !== 'OK') {
+        return { valid: false, error: `FCT status must be OK. Current status: ${fct.result}`, quality };
+    }
+
+    return { valid: true, quality };
+}
+
+function normalizeStatus(value) {
+    return String(value || '').trim().toUpperCase();
 }
 
 function buildBoxFileContent(scans, lastScan) {
