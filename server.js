@@ -12,7 +12,7 @@ const scansRouter = require('./routes/scans');
 
 const app = express();
 const host = process.env.HOST || '0.0.0.0';
-const port = parsePort(process.env.PORT, 3000);
+const port = parsePort(process.env.PORT, 3001);
 
 // Middleware
 app.use(cors({
@@ -134,27 +134,63 @@ function ensureDependencies() {
 
     const packageJson = JSON.parse(fs.readFileSync(packageJsonPath, 'utf8'));
     const dependencies = Object.keys(packageJson.dependencies || {});
-    const missing = dependencies.filter((dependency) => {
-        try {
-            require.resolve(dependency, { paths: [__dirname] });
-            return false;
-        } catch (_) {
-            return true;
-        }
-    });
+    let invalid = findInvalidDependencies(dependencies);
 
-    if (missing.length === 0) {
+    if (invalid.length === 0) {
         return;
     }
 
-    console.log(`Installing missing dependencies: ${missing.join(', ')}`);
+    console.log(`Installing or repairing dependencies: ${invalid.map(item => item.dependency).join(', ')}`);
+    runNpmInstall(false);
 
+    invalid = findInvalidDependencies(dependencies);
+    if (invalid.length === 0) {
+        return;
+    }
+
+    console.log(`Forcing dependency repair: ${invalid.map(item => item.dependency).join(', ')}`);
+    runNpmInstall(true);
+
+    invalid = findInvalidDependencies(dependencies);
+    if (invalid.length > 0) {
+        const details = invalid
+            .map(item => `${item.dependency}: ${item.error.message}`)
+            .join('; ');
+        throw new Error(`Dependencies are still invalid after npm install: ${details}`);
+    }
+}
+
+function findInvalidDependencies(dependencies) {
+    return dependencies
+        .map((dependency) => {
+            try {
+                verifyDependency(dependency);
+                return null;
+            } catch (error) {
+                return { dependency, error };
+            }
+        })
+        .filter(Boolean);
+}
+
+function verifyDependency(dependency) {
+    const moduleNames = dependency === 'mysql2'
+        ? ['mysql2', 'mysql2/promise']
+        : [dependency];
+
+    for (const moduleName of moduleNames) {
+        const resolved = require.resolve(moduleName, { paths: [__dirname] });
+        require(resolved);
+    }
+}
+
+function runNpmInstall(force) {
     const npmCommand = process.platform === 'win32'
         ? process.env.ComSpec || 'cmd.exe'
         : 'npm';
     const npmArgs = process.platform === 'win32'
-        ? ['/d', '/s', '/c', 'npm install --omit=dev']
-        : ['install', '--omit=dev'];
+        ? ['/d', '/s', '/c', `npm install --omit=dev${force ? ' --force' : ''}`]
+        : ['install', '--omit=dev', ...(force ? ['--force'] : [])];
     const result = spawnSync(npmCommand, npmArgs, {
         cwd: __dirname,
         stdio: 'inherit',
