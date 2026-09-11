@@ -56,6 +56,7 @@ app.get('/', (req, res) => {
             'POST /api/scans/box/:boxCode/send - Generate BOX TXT file',
             'GET /api/scans/count/:partNumber - Get in-memory shift count',
             'GET /api/scans/box/:boxCode - Get pending box scans',
+            'DELETE /api/scans/box/:boxCode/scan/:barcode - Delete one pending scan',
             'DELETE /api/scans/box/:boxCode - Clear pending box scans',
             'GET /api/scans/status - Get share access status',
             'GET /health - Process health check',
@@ -77,6 +78,7 @@ function startServer() {
             console.log(`   POST   /api/scans/box/:code/send   - Generate BOX TXT file`);
             console.log(`   GET    /api/scans/count/:pn        - Get in-memory shift count`);
             console.log(`   GET    /api/scans/box/:code        - Get pending box scans`);
+            console.log(`   DELETE /api/scans/box/:code/scan/:barcode - Delete one pending scan`);
             console.log(`   DELETE /api/scans/box/:code        - Clear pending box scans`);
             console.log(`   GET    /api/scans/status           - Get share access status`);
             console.log(`   GET    /health                     - Process health check`);

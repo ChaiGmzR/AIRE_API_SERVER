@@ -192,6 +192,62 @@ router.get('/box/:boxCode', (req, res) => {
 });
 
 /**
+ * DELETE /api/scans/box/:boxCode/scan/:barcode
+ * Delete one pending scan from a box.
+ */
+router.delete('/box/:boxCode/scan/:barcode', (req, res) => {
+    try {
+        const { boxCode, barcode } = req.params;
+
+        const boxValidation = validateBoxId(boxCode);
+        if (!boxValidation.valid) {
+            return res.status(400).json({ error: boxValidation.error });
+        }
+
+        const barcodeValidation = validateBarCode(barcode);
+        if (!barcodeValidation.valid) {
+            return res.status(400).json({ error: barcodeValidation.error });
+        }
+
+        const boxScans = pendingBoxes.get(boxValidation.boxId);
+        if (!boxScans || boxScans.length === 0) {
+            return res.status(404).json({ error: 'No pending scans for this box' });
+        }
+
+        const scanIndex = boxScans.findIndex(scan => scan.serial === barcodeValidation.barcode);
+        if (scanIndex === -1) {
+            return res.status(404).json({ error: 'Barcode not found in this box' });
+        }
+
+        const [deletedScan] = boxScans.splice(scanIndex, 1);
+        renumberBoxScans(boxScans);
+
+        if (boxScans.length === 0) {
+            pendingBoxes.delete(boxValidation.boxId);
+        }
+
+        const currentPartNumber = boxScans[0]?.partNumber || null;
+        res.json({
+            success: true,
+            boxCode: boxValidation.boxId,
+            deleted: {
+                id: deletedScan.id,
+                serial: deletedScan.serial,
+                partNumber: deletedScan.partNumber
+            },
+            currentPartNumber,
+            counts: {
+                box: boxScans.length,
+                shift: getShiftCount(deletedScan.partNumber)
+            }
+        });
+    } catch (error) {
+        console.error('Error deleting pending scan:', error);
+        res.status(500).json({ error: 'Failed to delete scan', details: error.message });
+    }
+});
+
+/**
  * DELETE /api/scans/box/:boxCode
  * Clear pending scans for a box.
  */
@@ -230,6 +286,12 @@ function getOrCreateBox(boxCode) {
     return pendingBoxes.get(boxCode);
 }
 
+function renumberBoxScans(boxScans) {
+    boxScans.forEach((scan, index) => {
+        scan.id = index + 1;
+    });
+}
+
 function validateBoxPartNumber(boxScans, partNumber) {
     if (boxScans.length === 0) {
         return { valid: true };
@@ -257,10 +319,10 @@ async function validateQualityStatus(barcode) {
             [barcode]
         ),
         query(
-            `SELECT result, COALESCE(test_ts, TIMESTAMP(fecha, hora)) AS test_ts
-             FROM history_fct
-             WHERE barcode = ?
-             ORDER BY COALESCE(test_ts, TIMESTAMP(fecha, hora)) DESC
+            `SELECT final_result, COALESCE(end_at, start_at, file_modified_at, created_at) AS test_ts
+             FROM fct_test_results
+             WHERE serial_number = ?
+             ORDER BY COALESCE(end_at, start_at, file_modified_at, created_at) DESC
              LIMIT 1`,
             [barcode]
         )
@@ -276,7 +338,8 @@ async function validateQualityStatus(barcode) {
         },
         fct: {
             found: Boolean(fct),
-            status: fct?.result || null,
+            status: fct ? normalizeFctStatus(fct.final_result) : null,
+            rawStatus: fct?.final_result || null,
             timestamp: fct?.test_ts || null
         }
     };
@@ -293,8 +356,8 @@ async function validateQualityStatus(barcode) {
         return { valid: false, error: 'FCT status not found for this barcode', quality };
     }
 
-    if (normalizeStatus(fct.result) !== 'OK') {
-        return { valid: false, error: `FCT status must be OK. Current status: ${fct.result}`, quality };
+    if (normalizeFctStatus(fct.final_result) !== 'OK') {
+        return { valid: false, error: `FCT status must be OK. Current status: ${fct.final_result}`, quality };
     }
 
     return { valid: true, quality };
@@ -302,6 +365,19 @@ async function validateQualityStatus(barcode) {
 
 function normalizeStatus(value) {
     return String(value || '').trim().toUpperCase();
+}
+
+function normalizeFctStatus(value) {
+    const status = normalizeStatus(value);
+    if (status === 'PASS') {
+        return 'OK';
+    }
+
+    if (status === 'FAIL') {
+        return 'NG';
+    }
+
+    return status;
 }
 
 function buildBoxFileContent(scans, lastScan) {
