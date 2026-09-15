@@ -11,6 +11,16 @@ const router = express.Router();
 const DEFAULT_BOX_DATA_PATH = '\\\\192.168.1.144\\lg-pws\\TDATA\\BOX\\DATA';
 const BOX_DATA_PATH = process.env.BOX_DATA_PATH || DEFAULT_BOX_DATA_PATH;
 const HISTORY_RETENTION_MS = 24 * 60 * 60 * 1000;
+const PRODUCTION_TYPES = {
+    MAIN_PCB: {
+        label: 'MAIN PCB',
+        lines: ['M1', 'M2', 'M3', 'M4']
+    },
+    DISPLAY: {
+        label: 'DISPLAY',
+        lines: ['D1', 'D2', 'D3']
+    }
+};
 
 const pendingBoxes = new Map();
 const scanHistory = [];
@@ -18,7 +28,7 @@ const scanHistory = [];
 /**
  * POST /api/scans
  * Register a pending piece scan for the active box.
- * Body: { boxCode, barcode }
+ * Body: { boxCode, barcode, productionType, lineCode }
  */
 router.post('/', async (req, res) => {
     try {
@@ -34,10 +44,20 @@ router.post('/', async (req, res) => {
             return res.status(400).json({ error: barcodeValidation.error });
         }
 
+        const productionValidation = validateProductionSelection(req.body);
+        if (!productionValidation.valid) {
+            return res.status(400).json({ error: productionValidation.error });
+        }
+
         const existingBoxScans = pendingBoxes.get(boxValidation.boxId) || [];
         const duplicate = existingBoxScans.some(scan => scan.serial === barcodeValidation.barcode);
         if (duplicate) {
             return res.status(409).json({ error: 'Barcode already scanned in this box' });
+        }
+
+        const boxProductionValidation = validateBoxProductionSelection(existingBoxScans, productionValidation.selection);
+        if (!boxProductionValidation.valid) {
+            return res.status(409).json({ error: boxProductionValidation.error });
         }
 
         const partValidation = validateBoxPartNumber(existingBoxScans, barcodeValidation.partNumber);
@@ -45,7 +65,11 @@ router.post('/', async (req, res) => {
             return res.status(409).json({ error: partValidation.error });
         }
 
-        const testStatus = await validateQualityStatus(barcodeValidation.barcode);
+        const testStatus = await validateQualityStatus(
+            barcodeValidation.barcode,
+            barcodeValidation.partNumber,
+            productionValidation.selection
+        );
         if (!testStatus.valid) {
             return res.status(409).json({
                 error: testStatus.error,
@@ -60,6 +84,9 @@ router.post('/', async (req, res) => {
             serial: barcodeValidation.barcode,
             boxCode: boxValidation.boxId,
             partNumber: barcodeValidation.partNumber,
+            productionType: productionValidation.selection.productionType,
+            productionLabel: productionValidation.selection.productionLabel,
+            lineCode: productionValidation.selection.lineCode,
             firstScan: formatDateTime(now),
             scanDate: now
         };
@@ -72,6 +99,9 @@ router.post('/', async (req, res) => {
                 serial: scan.serial,
                 boxCode: scan.boxCode,
                 partNumber: scan.partNumber,
+                productionType: scan.productionType,
+                productionLabel: scan.productionLabel,
+                lineCode: scan.lineCode,
                 scanTime: scan.firstScan
             },
             counts: {
@@ -182,7 +212,10 @@ router.get('/box/:boxCode', (req, res) => {
                 boxCode: scan.boxCode,
                 firstScan: scan.firstScan,
                 lastScan: null,
-                partNumber: extractPartNumber(scan.serial)
+                partNumber: extractPartNumber(scan.serial),
+                productionType: scan.productionType,
+                productionLabel: scan.productionLabel,
+                lineCode: scan.lineCode
             }))
         });
     } catch (error) {
@@ -211,12 +244,36 @@ router.delete('/box/:boxCode/scan/:barcode', (req, res) => {
 
         const boxScans = pendingBoxes.get(boxValidation.boxId);
         if (!boxScans || boxScans.length === 0) {
-            return res.status(404).json({ error: 'No pending scans for this box' });
+            return res.json({
+                success: true,
+                alreadyDeleted: true,
+                boxCode: boxValidation.boxId,
+                deleted: null,
+                currentPartNumber: null,
+                counts: {
+                    box: 0,
+                    shift: getShiftCount(barcodeValidation.partNumber)
+                }
+            });
         }
 
         const scanIndex = boxScans.findIndex(scan => scan.serial === barcodeValidation.barcode);
         if (scanIndex === -1) {
-            return res.status(404).json({ error: 'Barcode not found in this box' });
+            const currentPartNumber = boxScans[0]?.partNumber || null;
+            return res.json({
+                success: true,
+                alreadyDeleted: true,
+                boxCode: boxValidation.boxId,
+                deleted: {
+                    serial: barcodeValidation.barcode,
+                    partNumber: barcodeValidation.partNumber
+                },
+                currentPartNumber,
+                counts: {
+                    box: boxScans.length,
+                    shift: getShiftCount(currentPartNumber || barcodeValidation.partNumber)
+                }
+            });
         }
 
         const [deletedScan] = boxScans.splice(scanIndex, 1);
@@ -292,6 +349,74 @@ function renumberBoxScans(boxScans) {
     });
 }
 
+function validateProductionSelection(body = {}) {
+    const productionType = normalizeProductionType(
+        body.productionType || body.productType || body.processType || body.flow || 'MAIN_PCB'
+    );
+    if (!productionType || !PRODUCTION_TYPES[productionType]) {
+        return {
+            valid: false,
+            error: 'Invalid production type. Allowed values: MAIN PCB, DISPLAY'
+        };
+    }
+
+    const allowedLines = PRODUCTION_TYPES[productionType].lines;
+    const lineCode = normalizeStatus(
+        body.lineCode || body.line || body.productionLine || allowedLines[0]
+    );
+    if (!allowedLines.includes(lineCode)) {
+        return {
+            valid: false,
+            error: `Invalid line for ${PRODUCTION_TYPES[productionType].label}. Allowed lines: ${allowedLines.join(', ')}`
+        };
+    }
+
+    return {
+        valid: true,
+        selection: {
+            productionType,
+            productionLabel: PRODUCTION_TYPES[productionType].label,
+            lineCode
+        }
+    };
+}
+
+function normalizeProductionType(value) {
+    const normalized = normalizeStatus(value).replace(/[\s-]+/g, '_');
+    if (normalized === 'MAIN' || normalized === 'MAINPCB' || normalized === 'MAIN_PCB') {
+        return 'MAIN_PCB';
+    }
+
+    if (normalized === 'DISPLAY') {
+        return 'DISPLAY';
+    }
+
+    return normalized;
+}
+
+function validateBoxProductionSelection(boxScans, selection) {
+    if (boxScans.length === 0) {
+        return { valid: true };
+    }
+
+    const expectedProductionType = boxScans[0].productionType || 'MAIN_PCB';
+    const expectedLineCode = boxScans[0].lineCode || PRODUCTION_TYPES[expectedProductionType]?.lines[0];
+
+    if (expectedProductionType === selection.productionType && expectedLineCode === selection.lineCode) {
+        return { valid: true };
+    }
+
+    return {
+        valid: false,
+        error: `Production line mismatch. Expected ${formatProductionSelection(expectedProductionType, expectedLineCode)}, got ${formatProductionSelection(selection.productionType, selection.lineCode)}`
+    };
+}
+
+function formatProductionSelection(productionType, lineCode) {
+    const productionLabel = PRODUCTION_TYPES[productionType]?.label || productionType;
+    return `${productionLabel} ${lineCode || ''}`.trim();
+}
+
 function validateBoxPartNumber(boxScans, partNumber) {
     if (boxScans.length === 0) {
         return { valid: true };
@@ -308,7 +433,15 @@ function validateBoxPartNumber(boxScans, partNumber) {
     };
 }
 
-async function validateQualityStatus(barcode) {
+async function validateQualityStatus(barcode, partNumber, productionSelection) {
+    if (productionSelection.productionType === 'DISPLAY') {
+        return validateDisplayQualityStatus(barcode, partNumber, productionSelection);
+    }
+
+    return validateMainPcbQualityStatus(barcode);
+}
+
+async function validateMainPcbQualityStatus(barcode) {
     const [ictRows, fctRows] = await Promise.all([
         query(
             `SELECT resultado, ts
@@ -331,6 +464,7 @@ async function validateQualityStatus(barcode) {
     const ict = ictRows[0] || null;
     const fct = fctRows[0] || null;
     const quality = {
+        productionType: 'MAIN_PCB',
         ict: {
             found: Boolean(ict),
             status: ict?.resultado || null,
@@ -363,6 +497,98 @@ async function validateQualityStatus(barcode) {
     return { valid: true, quality };
 }
 
+async function validateDisplayQualityStatus(barcode, partNumber, productionSelection) {
+    const searchValues = getDisplaySearchValues(barcode, partNumber);
+    const placeholders = searchValues.map(() => '?').join(', ');
+    const rows = await query(
+        `SELECT raw, event_id, ts, fecha, nparte, modelo, lot_no, linea, lado, display_verificado,
+                CASE
+                    WHEN raw IN (${placeholders})
+                      OR lot_no IN (${placeholders})
+                      OR event_id IN (${placeholders})
+                    THEN 0
+                    ELSE 1
+                END AS match_rank
+         FROM history_prueba_electrica
+         WHERE raw IN (${placeholders})
+            OR lot_no IN (${placeholders})
+            OR event_id IN (${placeholders})
+            OR nparte IN (${placeholders})
+         ORDER BY match_rank ASC, ts DESC
+         LIMIT 1`,
+        [
+            ...searchValues,
+            ...searchValues,
+            ...searchValues,
+            ...searchValues,
+            ...searchValues,
+            ...searchValues,
+            ...searchValues
+        ]
+    );
+
+    const display = rows[0] || null;
+    const testedLine = normalizeStatus(display?.linea);
+    const electricalStatus = display ? normalizeElectricalStatus(display.display_verificado) : null;
+    const quality = {
+        productionType: 'DISPLAY',
+        electrical: {
+            found: Boolean(display),
+            status: electricalStatus,
+            rawStatus: display?.display_verificado ?? null,
+            line: display?.linea || null,
+            expectedLine: productionSelection.lineCode,
+            partNumber: display?.nparte || null,
+            model: display?.modelo || null,
+            lotNo: display?.lot_no || null,
+            eventId: display?.event_id || null,
+            side: display?.lado || null,
+            timestamp: display?.ts || null
+        }
+    };
+
+    if (!display) {
+        return { valid: false, error: 'Electrical test status not found for this barcode', quality };
+    }
+
+    if (electricalStatus !== 'OK') {
+        return {
+            valid: false,
+            error: `Electrical test must be OK. Current status: ${formatElectricalStatus(display.display_verificado)}`,
+            quality
+        };
+    }
+
+    if (testedLine && testedLine !== productionSelection.lineCode) {
+        return {
+            valid: false,
+            error: `Electrical test line mismatch. Expected ${productionSelection.lineCode}, got ${display.linea}`,
+            quality
+        };
+    }
+
+    return { valid: true, quality };
+}
+
+function getDisplaySearchValues(barcode, partNumber) {
+    const values = [];
+    addUniqueValue(values, barcode);
+    addUniqueValue(values, partNumber);
+
+    for (const segment of String(barcode || '').split('ñ')) {
+        addUniqueValue(values, segment);
+    }
+
+    return values;
+}
+
+function addUniqueValue(values, value) {
+    const normalized = String(value || '').trim();
+    if (normalized && !values.includes(normalized)) {
+        values.push(normalized);
+    }
+}
+
 function normalizeStatus(value) {
     return String(value || '').trim().toUpperCase();
 }
@@ -378,6 +604,31 @@ function normalizeFctStatus(value) {
     }
 
     return status;
+}
+
+function normalizeElectricalStatus(value) {
+    if (value === true || value === 1) {
+        return 'OK';
+    }
+
+    if (value === false || value === 0) {
+        return 'NG';
+    }
+
+    const status = normalizeStatus(value);
+    if (['1', 'OK', 'PASS', 'TRUE', 'VERIFIED', 'SI', 'YES'].includes(status)) {
+        return 'OK';
+    }
+
+    if (['0', 'NG', 'FAIL', 'FALSE', 'NOT_VERIFIED', 'NO'].includes(status)) {
+        return 'NG';
+    }
+
+    return status;
+}
+
+function formatElectricalStatus(value) {
+    return normalizeElectricalStatus(value) || 'UNKNOWN';
 }
 
 function buildBoxFileContent(scans, lastScan) {

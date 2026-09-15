@@ -52,7 +52,7 @@ app.get('/', (req, res) => {
         name: 'Ilsan Packing System API',
         version: '1.0.0',
         endpoints: [
-            'POST /api/scans - Register a pending scan',
+            'POST /api/scans - Register a pending scan using selected production line',
             'POST /api/scans/box/:boxCode/send - Generate BOX TXT file',
             'GET /api/scans/count/:partNumber - Get in-memory shift count',
             'GET /api/scans/box/:boxCode - Get pending box scans',
@@ -74,7 +74,7 @@ function startServer() {
             console.log(`   Bound:   http://${host}:${port}`);
 
             console.log(`\n📡 API Endpoints:`);
-            console.log(`   POST   /api/scans                  - Register a pending scan`);
+            console.log(`   POST   /api/scans                  - Register a pending scan using selected production line`);
             console.log(`   POST   /api/scans/box/:code/send   - Generate BOX TXT file`);
             console.log(`   GET    /api/scans/count/:pn        - Get in-memory shift count`);
             console.log(`   GET    /api/scans/box/:code        - Get pending box scans`);
