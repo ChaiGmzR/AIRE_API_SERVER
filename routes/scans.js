@@ -52,7 +52,7 @@ router.post('/', async (req, res) => {
         const existingBoxScans = pendingBoxes.get(boxValidation.boxId) || [];
         const duplicate = existingBoxScans.some(scan => scan.serial === barcodeValidation.barcode);
         if (duplicate) {
-            return res.status(409).json({ error: 'Barcode already scanned in this box' });
+            return res.status(409).json({ error: 'Este BarCode ya fue escaneado en esta caja' });
         }
 
         const boxProductionValidation = validateBoxProductionSelection(existingBoxScans, productionValidation.selection);
@@ -111,7 +111,7 @@ router.post('/', async (req, res) => {
         });
     } catch (error) {
         console.error('Error registering pending scan:', error);
-        res.status(500).json({ error: 'Failed to register scan', details: error.message });
+        res.status(500).json({ error: 'Error al registrar el escaneo', details: error.message });
     }
 });
 
@@ -130,7 +130,7 @@ router.post('/box/:boxCode/send', async (req, res) => {
 
         const boxScans = pendingBoxes.get(boxValidation.boxId) || [];
         if (boxScans.length === 0) {
-            return res.status(400).json({ error: 'No pending scans for this box' });
+            return res.status(400).json({ error: 'No hay escaneos pendientes para esta caja' });
         }
 
         await fs.access(BOX_DATA_PATH, constants.W_OK);
@@ -167,7 +167,7 @@ router.post('/box/:boxCode/send', async (req, res) => {
         });
     } catch (error) {
         console.error('Error sending box file:', error);
-        res.status(500).json({ error: 'Failed to send box file', details: error.message });
+        res.status(500).json({ error: 'Error al generar el archivo BOX', details: error.message });
     }
 });
 
@@ -190,7 +190,7 @@ router.get('/count/:partNumber', (req, res) => {
         });
     } catch (error) {
         console.error('Error getting shift count:', error);
-        res.status(500).json({ error: 'Failed to get count', details: error.message });
+        res.status(500).json({ error: 'Error al obtener el contador', details: error.message });
     }
 });
 
@@ -220,7 +220,7 @@ router.get('/box/:boxCode', (req, res) => {
         });
     } catch (error) {
         console.error('Error getting pending box scans:', error);
-        res.status(500).json({ error: 'Failed to get box scans', details: error.message });
+        res.status(500).json({ error: 'Error al obtener escaneos pendientes', details: error.message });
     }
 });
 
@@ -300,7 +300,7 @@ router.delete('/box/:boxCode/scan/:barcode', (req, res) => {
         });
     } catch (error) {
         console.error('Error deleting pending scan:', error);
-        res.status(500).json({ error: 'Failed to delete scan', details: error.message });
+        res.status(500).json({ error: 'Error al eliminar el escaneo', details: error.message });
     }
 });
 
@@ -323,7 +323,7 @@ router.delete('/box/:boxCode', (req, res) => {
         });
     } catch (error) {
         console.error('Error clearing pending box scans:', error);
-        res.status(500).json({ error: 'Failed to clear box scans', details: error.message });
+        res.status(500).json({ error: 'Error al limpiar los escaneos pendientes de la caja', details: error.message });
     }
 });
 
@@ -356,7 +356,7 @@ function validateProductionSelection(body = {}) {
     if (!productionType || !PRODUCTION_TYPES[productionType]) {
         return {
             valid: false,
-            error: 'Invalid production type. Allowed values: MAIN PCB, DISPLAY'
+            error: 'Tipo de produccion invalido. Valores permitidos: MAIN PCB, DISPLAY'
         };
     }
 
@@ -367,7 +367,7 @@ function validateProductionSelection(body = {}) {
     if (!allowedLines.includes(lineCode)) {
         return {
             valid: false,
-            error: `Invalid line for ${PRODUCTION_TYPES[productionType].label}. Allowed lines: ${allowedLines.join(', ')}`
+            error: `Linea invalida para ${PRODUCTION_TYPES[productionType].label}. Lineas permitidas: ${allowedLines.join(', ')}`
         };
     }
 
@@ -408,7 +408,7 @@ function validateBoxProductionSelection(boxScans, selection) {
 
     return {
         valid: false,
-        error: `Production line mismatch. Expected ${formatProductionSelection(expectedProductionType, expectedLineCode)}, got ${formatProductionSelection(selection.productionType, selection.lineCode)}`
+        error: `La linea de produccion no coincide. Esperado ${formatProductionSelection(expectedProductionType, expectedLineCode)}, recibido ${formatProductionSelection(selection.productionType, selection.lineCode)}`
     };
 }
 
@@ -429,7 +429,7 @@ function validateBoxPartNumber(boxScans, partNumber) {
 
     return {
         valid: false,
-        error: `Part number mismatch. Expected ${expectedPartNumber}, got ${partNumber}`
+        error: `Numero de parte distinto. Esperado ${expectedPartNumber}, recibido ${partNumber}`
     };
 }
 
@@ -479,19 +479,19 @@ async function validateMainPcbQualityStatus(barcode) {
     };
 
     if (!ict) {
-        return { valid: false, error: 'ICT status not found for this barcode', quality };
+        return { valid: false, error: 'No se encontro estatus ICT para este BarCode', quality };
     }
 
     if (normalizeStatus(ict.resultado) !== 'OK') {
-        return { valid: false, error: `ICT status must be OK. Current status: ${ict.resultado}`, quality };
+        return { valid: false, error: `El estatus ICT debe ser OK. Estatus actual: ${ict.resultado}`, quality };
     }
 
     if (!fct) {
-        return { valid: false, error: 'FCT status not found for this barcode', quality };
+        return { valid: false, error: 'No se encontro estatus FCT para este BarCode', quality };
     }
 
     if (normalizeFctStatus(fct.final_result) !== 'OK') {
-        return { valid: false, error: `FCT status must be OK. Current status: ${fct.final_result}`, quality };
+        return { valid: false, error: `El estatus FCT debe ser OK. Estatus actual: ${fct.final_result}`, quality };
     }
 
     return { valid: true, quality };
@@ -548,13 +548,13 @@ async function validateDisplayQualityStatus(barcode, partNumber, productionSelec
     };
 
     if (!display) {
-        return { valid: false, error: 'Electrical test status not found for this barcode', quality };
+        return { valid: false, error: 'No se encontro prueba electrica para este BarCode', quality };
     }
 
     if (electricalStatus !== 'OK') {
         return {
             valid: false,
-            error: `Electrical test must be OK. Current status: ${formatElectricalStatus(display.display_verificado)}`,
+            error: `La prueba electrica debe estar OK. Estatus actual: ${formatElectricalStatus(display.display_verificado)}`,
             quality
         };
     }
@@ -562,7 +562,7 @@ async function validateDisplayQualityStatus(barcode, partNumber, productionSelec
     if (testedLine && testedLine !== productionSelection.lineCode) {
         return {
             valid: false,
-            error: `Electrical test line mismatch. Expected ${productionSelection.lineCode}, got ${display.linea}`,
+            error: `La linea de prueba electrica no coincide. Esperado ${productionSelection.lineCode}, recibido ${display.linea}`,
             quality
         };
     }
@@ -650,7 +650,7 @@ async function getAvailableBoxFilePath(boxCode, date) {
         }
     }
 
-    throw new Error('Could not allocate a unique BOX file name');
+    throw new Error('No se pudo asignar un nombre unico para el archivo BOX');
 }
 
 async function pathExists(filePath) {

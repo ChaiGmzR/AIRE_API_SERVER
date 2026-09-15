@@ -42,14 +42,14 @@ function extractPartNumber(barcode) {
  */
 function validateBoxId(boxId) {
     if (!boxId || typeof boxId !== 'string') {
-        return { valid: false, error: 'Box ID is required' };
+        return { valid: false, error: 'El Box Id es requerido' };
     }
 
     const trimmed = boxId.trim();
 
     // Basic validation: should start with letters and contain numbers
     if (!/^[A-Z]{2,4}\d{10,15}$/.test(trimmed)) {
-        return { valid: false, error: 'Invalid Box ID format' };
+        return { valid: false, error: 'Formato de Box Id invalido' };
     }
 
     return { valid: true, boxId: trimmed };
@@ -60,18 +60,18 @@ function validateBoxId(boxId) {
  */
 function validateBarCode(barcode) {
     if (!barcode || typeof barcode !== 'string') {
-        return { valid: false, error: 'BarCode is required' };
+        return { valid: false, error: 'El BarCode es requerido' };
     }
 
     const trimmed = barcode.trim();
 
     if (trimmed.length < 11) {
-        return { valid: false, error: 'BarCode too short (minimum 11 characters)' };
+        return { valid: false, error: 'BarCode demasiado corto (minimo 11 caracteres)' };
     }
 
     const partNumber = extractPartNumber(trimmed);
     if (!partNumber) {
-        return { valid: false, error: 'Could not extract part number from BarCode' };
+        return { valid: false, error: 'No se pudo extraer el numero de parte del BarCode' };
     }
 
     return { valid: true, barcode: trimmed, partNumber };
