@@ -1,6 +1,6 @@
 {
   "name": "ilsan-packing-backend",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "description": "Backend for Ilsan Packing System",
   "main": "server.js",
   "scripts": {
