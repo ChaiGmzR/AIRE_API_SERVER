@@ -1,11 +1,12 @@
 {
   "name": "ilsan-packing-backend",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "Backend for Ilsan Packing System",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "dev": "node server.js"
+    "dev": "node server.js",
+    "backfill:boxing-registry": "node scripts/backfill_box_registry.js"
   },
   "dependencies": {
     "cors": "^2.8.5",

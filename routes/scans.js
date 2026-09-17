@@ -2,7 +2,12 @@ const express = require('express');
 const { constants } = require('fs');
 const fs = require('fs/promises');
 const path = require('path');
-const { query, testConnection } = require('../db');
+const {
+    query,
+    testConnection,
+    withTransaction,
+    ensureBoxingRegistryTables
+} = require('../db');
 const { extractPartNumber, validateBoxId, validateBarCode } = require('../utils/partNumber');
 const { getShiftTimeRange, formatDateTime } = require('../utils/shifts');
 
@@ -27,12 +32,14 @@ const scanHistory = [];
 
 /**
  * POST /api/scans
- * Register a pending piece scan for the active box.
+ * Validate a piece scan for the active box. New clients use validateOnly=true;
+ * legacy clients may still register an in-memory pending scan.
  * Body: { boxCode, barcode, productionType, lineCode }
  */
 router.post('/', async (req, res) => {
     try {
         const { boxCode, barcode } = req.body;
+        const validateOnly = req.body?.validateOnly === true;
 
         const boxValidation = validateBoxId(boxCode);
         if (!boxValidation.valid) {
@@ -49,7 +56,9 @@ router.post('/', async (req, res) => {
             return res.status(400).json({ error: productionValidation.error });
         }
 
-        const existingBoxScans = pendingBoxes.get(boxValidation.boxId) || [];
+        const existingBoxScans = validateOnly
+            ? []
+            : pendingBoxes.get(boxValidation.boxId) || [];
         const duplicate = existingBoxScans.some(scan => scan.serial === barcodeValidation.barcode);
         if (duplicate) {
             return res.status(409).json({ error: 'Este BarCode ya fue escaneado en esta caja' });
@@ -77,7 +86,9 @@ router.post('/', async (req, res) => {
             });
         }
 
-        const boxScans = getOrCreateBox(boxValidation.boxId);
+        const boxScans = validateOnly
+            ? []
+            : getOrCreateBox(boxValidation.boxId);
         const now = new Date();
         const scan = {
             id: boxScans.length + 1,
@@ -91,7 +102,9 @@ router.post('/', async (req, res) => {
             scanDate: now
         };
 
-        boxScans.push(scan);
+        if (!validateOnly) {
+            boxScans.push(scan);
+        }
 
         res.json({
             success: true,
@@ -105,8 +118,8 @@ router.post('/', async (req, res) => {
                 scanTime: scan.firstScan
             },
             counts: {
-                box: boxScans.length,
-                shift: getShiftCount(scan.partNumber)
+                box: validateOnly ? null : boxScans.length,
+                shift: await getShiftCountForResponse(scan.partNumber)
             }
         });
     } catch (error) {
@@ -120,6 +133,10 @@ router.post('/', async (req, res) => {
  * Write the active box scans to BOX DATA as a complete .txt file.
  */
 router.post('/box/:boxCode/send', async (req, res) => {
+    let targetPath = null;
+    let temporaryPath = null;
+    let fileCreated = false;
+
     try {
         const { boxCode } = req.params;
 
@@ -128,29 +145,130 @@ router.post('/box/:boxCode/send', async (req, res) => {
             return res.status(400).json({ error: boxValidation.error });
         }
 
-        const boxScans = pendingBoxes.get(boxValidation.boxId) || [];
+        const pendingScans = pendingBoxes.get(boxValidation.boxId) || [];
+        const requestBody = req.body && typeof req.body === 'object' ? req.body : {};
+        const productionValidation = getSendProductionSelection(requestBody, pendingScans);
+        if (!productionValidation.valid) {
+            return res.status(400).json({ error: productionValidation.error });
+        }
+
+        const boxScans = buildBoxScansForSend(
+            boxValidation.boxId,
+            requestBody,
+            pendingScans,
+            productionValidation.selection
+        );
         if (boxScans.length === 0) {
             return res.status(400).json({ error: 'No hay escaneos pendientes para esta caja' });
         }
 
+        const qualityValidation = await validateBoxScansQuality(
+            boxScans,
+            productionValidation.selection
+        );
+        if (!qualityValidation.valid) {
+            return res.status(409).json({
+                error: qualityValidation.error,
+                quality: qualityValidation.quality
+            });
+        }
+
+        await ensureBoxingRegistryTables();
         await fs.access(BOX_DATA_PATH, constants.W_OK);
 
         const sendDate = new Date();
         const lastScan = formatDateTime(sendDate);
-        const targetPath = await getAvailableBoxFilePath(boxValidation.boxId, sendDate);
-        const targetName = path.win32.basename(targetPath);
-        const tempPath = `${targetPath}.writing-${process.pid}-${Date.now()}`;
-        const content = buildBoxFileContent(boxScans, lastScan);
+        const result = await withTransaction(async (connection) => {
+            const [existingBoxes] = await connection.execute(
+                `SELECT box_code
+                 FROM aire_box_registry
+                 WHERE box_code = ?
+                 LIMIT 1
+                 FOR UPDATE`,
+                [boxValidation.boxId]
+            );
 
-        await fs.writeFile(tempPath, content, 'ascii');
-        await fs.rename(tempPath, targetPath);
+            if (existingBoxes.length > 0) {
+                throw createConflictError(
+                    `El Box Id ${boxValidation.boxId} ya fue registrado previamente`
+                );
+            }
+
+            const barcodes = boxScans.map(scan => scan.serial);
+            const barcodePlaceholders = barcodes.map(() => '?').join(', ');
+            const [existingPieces] = await connection.execute(
+                `SELECT barcode, box_code
+                 FROM aire_piece_registry
+                 WHERE barcode IN (${barcodePlaceholders})
+                 FOR UPDATE`,
+                barcodes
+            );
+
+            if (existingPieces.length > 0) {
+                const duplicate = existingPieces[0];
+                throw createConflictError(
+                    `El BarCode ${duplicate.barcode} ya fue registrado previamente en la caja ${duplicate.box_code}`
+                );
+            }
+
+            targetPath = await getAvailableBoxFilePath(boxValidation.boxId, sendDate);
+            const targetName = path.win32.basename(targetPath);
+            temporaryPath = `${targetPath}.writing-${process.pid}-${Date.now()}`;
+            const content = buildBoxFileContent(boxScans, lastScan);
+
+            await connection.execute(
+                `INSERT INTO aire_box_registry
+                    (box_code, part_number, production_type, line_code, file_name, row_count, status, registered_at)
+                 VALUES (?, ?, ?, ?, ?, ?, 'RESERVED', ?)`,
+                [
+                    boxValidation.boxId,
+                    boxScans[0].partNumber,
+                    productionValidation.selection.productionType,
+                    productionValidation.selection.lineCode,
+                    targetName,
+                    boxScans.length,
+                    sendDate
+                ]
+            );
+
+            for (const scan of boxScans) {
+                await connection.execute(
+                    `INSERT INTO aire_piece_registry
+                        (barcode, box_code, part_number, production_type, line_code, scanned_at, registered_at)
+                     VALUES (?, ?, ?, ?, ?, ?, ?)`,
+                    [
+                        scan.serial,
+                        boxValidation.boxId,
+                        scan.partNumber,
+                        productionValidation.selection.productionType,
+                        productionValidation.selection.lineCode,
+                        scan.scanDate,
+                        sendDate
+                    ]
+                );
+            }
+
+            await fs.writeFile(temporaryPath, content, 'ascii');
+            await fs.rename(temporaryPath, targetPath);
+            fileCreated = true;
+
+            await connection.execute(
+                `UPDATE aire_box_registry
+                 SET status = 'SENT'
+                 WHERE box_code = ?`,
+                [boxValidation.boxId]
+            );
+
+            return {
+                name: targetName,
+                path: targetPath,
+                rows: boxScans.length,
+                lastScan
+            };
+        });
 
         for (const scan of boxScans) {
-            scanHistory.push({
-                ...scan,
-                lastScan,
-                sentAt: sendDate
-            });
+            scanHistory.push({ ...scan, lastScan, sentAt: sendDate });
         }
         pendingBoxes.delete(boxValidation.boxId);
         pruneHistory();
@@ -158,14 +276,26 @@ router.post('/box/:boxCode/send', async (req, res) => {
         res.json({
             success: true,
             boxCode: boxValidation.boxId,
-            file: {
-                name: targetName,
-                path: targetPath,
-                rows: boxScans.length,
-                lastScan
-            }
+            file: result
         });
     } catch (error) {
+        if (temporaryPath && !fileCreated) {
+            await removeFileIfExists(temporaryPath);
+        }
+        if (targetPath && fileCreated) {
+            await removeFileIfExists(targetPath);
+        }
+
+        if (error.statusCode) {
+            return res.status(error.statusCode).json({ error: error.message });
+        }
+
+        if (error.code === 'ER_DUP_ENTRY') {
+            return res.status(409).json({
+                error: 'El Box Id o una pieza ya fue registrada previamente'
+            });
+        }
+
         console.error('Error sending box file:', error);
         res.status(500).json({ error: 'Error al generar el archivo BOX', details: error.message });
     }
@@ -173,12 +303,12 @@ router.post('/box/:boxCode/send', async (req, res) => {
 
 /**
  * GET /api/scans/count/:partNumber
- * Get in-memory shift count for a part number.
+ * Get the shift count, including persisted scans from all client PCs.
  */
-router.get('/count/:partNumber', (req, res) => {
+router.get('/count/:partNumber', async (req, res) => {
     try {
         const { partNumber } = req.params;
-        const count = getShiftCount(partNumber);
+        const count = await getShiftCountForResponse(partNumber);
         const shiftInfo = getShiftTimeRange();
 
         res.json({
@@ -228,7 +358,7 @@ router.get('/box/:boxCode', (req, res) => {
  * DELETE /api/scans/box/:boxCode/scan/:barcode
  * Delete one pending scan from a box.
  */
-router.delete('/box/:boxCode/scan/:barcode', (req, res) => {
+router.delete('/box/:boxCode/scan/:barcode', async (req, res) => {
     try {
         const { boxCode, barcode } = req.params;
 
@@ -252,7 +382,7 @@ router.delete('/box/:boxCode/scan/:barcode', (req, res) => {
                 currentPartNumber: null,
                 counts: {
                     box: 0,
-                    shift: getShiftCount(barcodeValidation.partNumber)
+                    shift: await getShiftCountForResponse(barcodeValidation.partNumber)
                 }
             });
         }
@@ -271,7 +401,7 @@ router.delete('/box/:boxCode/scan/:barcode', (req, res) => {
                 currentPartNumber,
                 counts: {
                     box: boxScans.length,
-                    shift: getShiftCount(currentPartNumber || barcodeValidation.partNumber)
+                    shift: await getShiftCountForResponse(currentPartNumber || barcodeValidation.partNumber)
                 }
             });
         }
@@ -295,7 +425,7 @@ router.delete('/box/:boxCode/scan/:barcode', (req, res) => {
             currentPartNumber,
             counts: {
                 box: boxScans.length,
-                shift: getShiftCount(deletedScan.partNumber)
+                shift: await getShiftCountForResponse(deletedScan.partNumber)
             }
         });
     } catch (error) {
@@ -308,7 +438,7 @@ router.delete('/box/:boxCode/scan/:barcode', (req, res) => {
  * DELETE /api/scans/box/:boxCode
  * Clear pending scans for a box.
  */
-router.delete('/box/:boxCode', (req, res) => {
+router.delete('/box/:boxCode', async (req, res) => {
     try {
         const { boxCode } = req.params;
         const boxScans = pendingBoxes.get(boxCode) || [];
@@ -335,6 +465,126 @@ router.get('/status', async (req, res) => {
     const status = await getSystemStatus();
     res.json(status);
 });
+
+function getSendProductionSelection(body = {}, pendingScans = []) {
+    const selectionFields = [
+        'productionType',
+        'productType',
+        'processType',
+        'flow',
+        'lineCode',
+        'line',
+        'productionLine'
+    ];
+    const hasSelection = selectionFields.some(field => body[field] !== undefined);
+
+    if (hasSelection || pendingScans.length === 0) {
+        return validateProductionSelection(body);
+    }
+
+    const firstScan = pendingScans[0];
+    const productionType = firstScan.productionType || 'MAIN_PCB';
+    const lineCode = firstScan.lineCode || PRODUCTION_TYPES[productionType]?.lines[0];
+    return validateProductionSelection({ productionType, lineCode });
+}
+
+function buildBoxScansForSend(boxCode, body = {}, pendingScans, selection) {
+    if (!Array.isArray(body.scans)) {
+        return pendingScans.map((scan, index) => ({
+            ...scan,
+            id: index + 1,
+            boxCode,
+            productionType: selection.productionType,
+            productionLabel: selection.productionLabel,
+            lineCode: selection.lineCode,
+            scanDate: scan.scanDate instanceof Date ? scan.scanDate : new Date(),
+            firstScan: scan.firstScan || formatDateTime(new Date())
+        }));
+    }
+
+    const scans = [];
+    const seenBarcodes = new Set();
+    let expectedPartNumber = null;
+
+    for (const [index, item] of body.scans.entries()) {
+        const rawBarcode = typeof item === 'string'
+            ? item
+            : item?.barcode || item?.serial;
+        const barcodeValidation = validateBarCode(rawBarcode);
+
+        if (!barcodeValidation.valid) {
+            throw createHttpError(400, barcodeValidation.error);
+        }
+
+        if (seenBarcodes.has(barcodeValidation.barcode)) {
+            throw createConflictError(
+                `Este BarCode ya fue escaneado en esta caja: ${barcodeValidation.barcode}`
+            );
+        }
+        seenBarcodes.add(barcodeValidation.barcode);
+
+        if (expectedPartNumber === null) {
+            expectedPartNumber = barcodeValidation.partNumber;
+        } else if (expectedPartNumber !== barcodeValidation.partNumber) {
+            throw createConflictError(
+                `Numero de parte distinto. Esperado ${expectedPartNumber}, recibido ${barcodeValidation.partNumber}`
+            );
+        }
+
+        const scanDate = parseScanDate(item?.firstScan || item?.readTime || item?.scanTime);
+        scans.push({
+            id: index + 1,
+            serial: barcodeValidation.barcode,
+            boxCode,
+            partNumber: barcodeValidation.partNumber,
+            productionType: selection.productionType,
+            productionLabel: selection.productionLabel,
+            lineCode: selection.lineCode,
+            firstScan: formatDateTime(scanDate),
+            scanDate
+        });
+    }
+
+    return scans;
+}
+
+async function validateBoxScansQuality(boxScans, selection) {
+    for (const scan of boxScans) {
+        const quality = await validateQualityStatus(scan.serial, scan.partNumber, selection);
+        if (!quality.valid) {
+            return quality;
+        }
+    }
+
+    return { valid: true };
+}
+
+function parseScanDate(value) {
+    if (value instanceof Date && !Number.isNaN(value.getTime())) {
+        return value;
+    }
+
+    const parsed = value ? new Date(value) : new Date();
+    return Number.isNaN(parsed.getTime()) ? new Date() : parsed;
+}
+
+function createHttpError(statusCode, message) {
+    const error = new Error(message);
+    error.statusCode = statusCode;
+    return error;
+}
+
+function createConflictError(message) {
+    return createHttpError(409, message);
+}
+
+async function removeFileIfExists(filePath) {
+    try {
+        await fs.unlink(filePath);
+    } catch (_) {
+        // The file may not have been created or may already be gone.
+    }
+}
 
 function getOrCreateBox(boxCode) {
     if (!pendingBoxes.has(boxCode)) {
@@ -679,6 +929,35 @@ function getShiftCount(partNumber) {
             scan.scanDate < shiftInfo.endDate
         )
         .length;
+}
+
+async function getShiftCountForResponse(partNumber) {
+    const shiftInfo = getShiftTimeRange();
+
+    try {
+        const rows = await query(
+            `SELECT COUNT(*) AS count
+             FROM aire_piece_registry
+             WHERE part_number = ?
+               AND registered_at >= ?
+               AND registered_at < ?`,
+            [partNumber, shiftInfo.startDate, shiftInfo.endDate]
+        );
+
+        const persistedCount = Number(rows[0]?.count || 0);
+        const pendingCount = Array.from(pendingBoxes.values())
+            .flat()
+            .filter(scan =>
+                scan.partNumber === partNumber &&
+                scan.scanDate >= shiftInfo.startDate &&
+                scan.scanDate < shiftInfo.endDate
+            )
+            .length;
+
+        return persistedCount + pendingCount;
+    } catch (_) {
+        return getShiftCount(partNumber);
+    }
 }
 
 function getAllKnownScans() {
