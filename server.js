@@ -15,7 +15,6 @@ const app = express();
 const host = process.env.HOST || '0.0.0.0';
 const port = parsePort(process.env.PORT, 3001);
 const appVersion = process.env.APP_VERSION || packageInfo.version || '1.0.0';
-const requiredClientVersion = process.env.REQUIRED_CLIENT_VERSION || appVersion;
 
 // Middleware
 app.use(cors({
@@ -49,13 +48,11 @@ app.get('/ready', async (req, res) => {
     });
 });
 
-// Version endpoint used by the Windows client at startup
+// Version endpoint for backend diagnostics. The Windows client validates itself against GitHub.
 app.get('/api/version', (req, res) => {
     res.json({
         name: 'Ilsan Packing System API',
         version: appVersion,
-        requiredClientVersion,
-        minimumClientVersion: requiredClientVersion,
         serverTime: new Date().toISOString()
     });
 });
@@ -66,7 +63,7 @@ app.get('/', (req, res) => {
         name: 'Ilsan Packing System API',
         version: appVersion,
         endpoints: [
-            'GET /api/version - Validate API/client version',
+            'GET /api/version - Get backend version',
             'POST /api/scans - Validate a scan using selected production line',
             'POST /api/scans/box/:boxCode/send - Generate BOX TXT file',
             'GET /api/scans/count/:partNumber - Get persisted shift count',
