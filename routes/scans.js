@@ -4,9 +4,7 @@ const fs = require('fs/promises');
 const path = require('path');
 const {
     query,
-    testConnection,
-    withTransaction,
-    ensureBoxingRegistryTables
+    testConnection
 } = require('../db');
 const { extractPartNumber, validateBoxId, validateBarCode } = require('../utils/partNumber');
 const { getShiftTimeRange, formatDateTime } = require('../utils/shifts');
@@ -173,99 +171,38 @@ router.post('/box/:boxCode/send', async (req, res) => {
             });
         }
 
-        await ensureBoxingRegistryTables();
+        const existingBoxes = await query(
+            `SELECT box_code
+             FROM box_scans
+             WHERE box_code = ?
+             LIMIT 1`,
+            [boxValidation.boxId]
+        );
+        if (existingBoxes.length > 0) {
+            return res.status(409).json({
+                error: `El Box Id ${boxValidation.boxId} ya fue registrado previamente`
+            });
+        }
+
         await fs.access(BOX_DATA_PATH, constants.W_OK);
 
         const sendDate = new Date();
         const lastScan = formatDateTime(sendDate);
-        const result = await withTransaction(async (connection) => {
-            const [existingBoxes] = await connection.execute(
-                `SELECT box_code
-                 FROM aire_box_registry
-                 WHERE box_code = ?
-                 LIMIT 1
-                 FOR UPDATE`,
-                [boxValidation.boxId]
-            );
+        targetPath = await getAvailableBoxFilePath(boxValidation.boxId, sendDate);
+        const targetName = path.win32.basename(targetPath);
+        temporaryPath = `${targetPath}.writing-${process.pid}-${Date.now()}`;
+        const content = buildBoxFileContent(boxScans, lastScan);
 
-            if (existingBoxes.length > 0) {
-                throw createConflictError(
-                    `El Box Id ${boxValidation.boxId} ya fue registrado previamente`
-                );
-            }
+        await fs.writeFile(temporaryPath, content, 'ascii');
+        await fs.rename(temporaryPath, targetPath);
+        fileCreated = true;
 
-            const barcodes = boxScans.map(scan => scan.serial);
-            const barcodePlaceholders = barcodes.map(() => '?').join(', ');
-            const [existingPieces] = await connection.execute(
-                `SELECT barcode, box_code
-                 FROM aire_piece_registry
-                 WHERE barcode IN (${barcodePlaceholders})
-                 FOR UPDATE`,
-                barcodes
-            );
-
-            if (existingPieces.length > 0) {
-                const duplicate = existingPieces[0];
-                throw createConflictError(
-                    `El BarCode ${duplicate.barcode} ya fue registrado previamente en la caja ${duplicate.box_code}`
-                );
-            }
-
-            targetPath = await getAvailableBoxFilePath(boxValidation.boxId, sendDate);
-            const targetName = path.win32.basename(targetPath);
-            temporaryPath = `${targetPath}.writing-${process.pid}-${Date.now()}`;
-            const content = buildBoxFileContent(boxScans, lastScan);
-
-            await connection.execute(
-                `INSERT INTO aire_box_registry
-                    (box_code, part_number, production_type, line_code, file_name, row_count, status, registered_at)
-                 VALUES (?, ?, ?, ?, ?, ?, 'RESERVED', ?)`,
-                [
-                    boxValidation.boxId,
-                    boxScans[0].partNumber,
-                    productionValidation.selection.productionType,
-                    productionValidation.selection.lineCode,
-                    targetName,
-                    boxScans.length,
-                    sendDate
-                ]
-            );
-
-            for (const scan of boxScans) {
-                await connection.execute(
-                    `INSERT INTO aire_piece_registry
-                        (barcode, box_code, part_number, production_type, line_code, scanned_at, registered_at)
-                     VALUES (?, ?, ?, ?, ?, ?, ?)`,
-                    [
-                        scan.serial,
-                        boxValidation.boxId,
-                        scan.partNumber,
-                        productionValidation.selection.productionType,
-                        productionValidation.selection.lineCode,
-                        scan.scanDate,
-                        sendDate
-                    ]
-                );
-            }
-
-            await fs.writeFile(temporaryPath, content, 'ascii');
-            await fs.rename(temporaryPath, targetPath);
-            fileCreated = true;
-
-            await connection.execute(
-                `UPDATE aire_box_registry
-                 SET status = 'SENT'
-                 WHERE box_code = ?`,
-                [boxValidation.boxId]
-            );
-
-            return {
-                name: targetName,
-                path: targetPath,
-                rows: boxScans.length,
-                lastScan
-            };
-        });
+        const result = {
+            name: targetName,
+            path: targetPath,
+            rows: boxScans.length,
+            lastScan
+        };
 
         for (const scan of boxScans) {
             scanHistory.push({ ...scan, lastScan, sentAt: sendDate });
@@ -290,13 +227,7 @@ router.post('/box/:boxCode/send', async (req, res) => {
             return res.status(error.statusCode).json({ error: error.message });
         }
 
-        if (error.code === 'ER_DUP_ENTRY') {
-            return res.status(409).json({
-                error: 'El Box Id o una pieza ya fue registrada previamente'
-            });
-        }
-
-        console.error('Error sending box file:', error);
+        console.error('Error generating box file:', error);
         res.status(500).json({ error: 'Error al generar el archivo BOX', details: error.message });
     }
 });
@@ -503,7 +434,6 @@ function buildBoxScansForSend(boxCode, body = {}, pendingScans, selection) {
     }
 
     const scans = [];
-    const seenBarcodes = new Set();
     let expectedPartNumber = null;
 
     for (const [index, item] of body.scans.entries()) {
@@ -515,13 +445,6 @@ function buildBoxScansForSend(boxCode, body = {}, pendingScans, selection) {
         if (!barcodeValidation.valid) {
             throw createHttpError(400, barcodeValidation.error);
         }
-
-        if (seenBarcodes.has(barcodeValidation.barcode)) {
-            throw createConflictError(
-                `Este BarCode ya fue escaneado en esta caja: ${barcodeValidation.barcode}`
-            );
-        }
-        seenBarcodes.add(barcodeValidation.barcode);
 
         if (expectedPartNumber === null) {
             expectedPartNumber = barcodeValidation.partNumber;
@@ -937,11 +860,11 @@ async function getShiftCountForResponse(partNumber) {
     try {
         const rows = await query(
             `SELECT COUNT(*) AS count
-             FROM aire_piece_registry
-             WHERE part_number = ?
-               AND registered_at >= ?
-               AND registered_at < ?`,
-            [partNumber, shiftInfo.startDate, shiftInfo.endDate]
+             FROM box_scans
+             WHERE first_scan >= ?
+               AND first_scan < ?
+               AND (LEFT(serial, 11) = ? OR serial LIKE CONCAT('%ñ', ?, 'ñ%'))`,
+            [shiftInfo.startDate, shiftInfo.endDate, partNumber, partNumber]
         );
 
         const persistedCount = Number(rows[0]?.count || 0);

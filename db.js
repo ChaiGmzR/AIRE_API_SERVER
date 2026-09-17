@@ -18,61 +18,6 @@ async function query(sql, params = [], poolName = 'default') {
     return rows;
 }
 
-async function withTransaction(callback, poolName = 'default') {
-    const connection = await getPool(poolName).getConnection();
-
-    try {
-        await connection.beginTransaction();
-        const result = await callback(connection);
-        await connection.commit();
-        return result;
-    } catch (error) {
-        try {
-            await connection.rollback();
-        } catch (_) {
-            // Preserve the original transaction error.
-        }
-        throw error;
-    } finally {
-        connection.release();
-    }
-}
-
-async function ensureBoxingRegistryTables() {
-    const pool = getPool();
-
-    await pool.execute(`
-        CREATE TABLE IF NOT EXISTS aire_box_registry (
-            box_code VARCHAR(64) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL,
-            part_number VARCHAR(64) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL,
-            production_type VARCHAR(32) NOT NULL,
-            line_code VARCHAR(8) NOT NULL,
-            file_name VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL,
-            row_count INT UNSIGNED NOT NULL,
-            status VARCHAR(16) NOT NULL,
-            registered_at DATETIME(6) NOT NULL,
-            PRIMARY KEY (box_code),
-            UNIQUE KEY uq_aire_box_file_name (file_name),
-            KEY idx_aire_box_registered_at (registered_at)
-        ) ENGINE=InnoDB
-    `);
-
-    await pool.execute(`
-        CREATE TABLE IF NOT EXISTS aire_piece_registry (
-            barcode VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL,
-            box_code VARCHAR(64) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL,
-            part_number VARCHAR(64) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL,
-            production_type VARCHAR(32) NOT NULL,
-            line_code VARCHAR(8) NOT NULL,
-            scanned_at DATETIME(6) NOT NULL,
-            registered_at DATETIME(6) NOT NULL,
-            PRIMARY KEY (barcode),
-            KEY idx_aire_piece_box_code (box_code),
-            KEY idx_aire_piece_part_registered (part_number, registered_at)
-        ) ENGINE=InnoDB
-    `);
-}
-
 async function testConnection(poolName = 'default') {
     try {
         const pool = getPool(poolName);
@@ -156,8 +101,6 @@ function normalizePoolName(name) {
 module.exports = {
     getPool,
     query,
-    withTransaction,
-    ensureBoxingRegistryTables,
     testConnection,
     closePools
 };
