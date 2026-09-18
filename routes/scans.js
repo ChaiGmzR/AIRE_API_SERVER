@@ -674,7 +674,7 @@ async function validateDisplayQualityStatus(barcode, partNumber, productionSelec
     const searchValues = getDisplaySearchValues(barcode, partNumber);
     const placeholders = searchValues.map(() => '?').join(', ');
     const rows = await query(
-        `SELECT raw, event_id, ts, fecha, nparte, modelo, lot_no, linea, lado, display_verificado,
+        `SELECT raw, event_id, ts, fecha, nparte, modelo, lot_no, linea, lado, resultado,
                 CASE
                     WHEN raw IN (${placeholders})
                       OR lot_no IN (${placeholders})
@@ -702,13 +702,13 @@ async function validateDisplayQualityStatus(barcode, partNumber, productionSelec
 
     const display = rows[0] || null;
     const testedLine = normalizeStatus(display?.linea);
-    const electricalStatus = display ? normalizeElectricalStatus(display.display_verificado) : null;
+    const electricalStatus = display ? normalizeElectricalStatus(display.resultado) : null;
     const quality = {
         productionType: 'DISPLAY',
         electrical: {
             found: Boolean(display),
             status: electricalStatus,
-            rawStatus: display?.display_verificado ?? null,
+            rawStatus: display?.resultado ?? null,
             line: display?.linea || null,
             expectedLine: productionSelection.lineCode,
             partNumber: display?.nparte || null,
@@ -727,7 +727,7 @@ async function validateDisplayQualityStatus(barcode, partNumber, productionSelec
     if (electricalStatus !== 'OK') {
         return {
             valid: false,
-            error: `La prueba electrica debe estar OK. Estatus actual: ${formatElectricalStatus(display.display_verificado)}`,
+            error: `La prueba electrica debe estar OK. Estatus actual: ${formatElectricalStatus(display.resultado)}`,
             quality
         };
     }
