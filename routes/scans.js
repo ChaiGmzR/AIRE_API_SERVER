@@ -608,7 +608,7 @@ function validateBoxPartNumber(boxScans, partNumber) {
 
 async function validateQualityStatus(barcode, partNumber, productionSelection) {
     if (productionSelection.productionType === 'DISPLAY') {
-        return validateDisplayQualityStatus(barcode, partNumber, productionSelection);
+        return validateDisplayQualityStatus(barcode, productionSelection);
     }
 
     return validateMainPcbQualityStatus(barcode);
@@ -670,34 +670,14 @@ async function validateMainPcbQualityStatus(barcode) {
     return { valid: true, quality };
 }
 
-async function validateDisplayQualityStatus(barcode, partNumber, productionSelection) {
-    const searchValues = getDisplaySearchValues(barcode, partNumber);
-    const placeholders = searchValues.map(() => '?').join(', ');
+async function validateDisplayQualityStatus(barcode, productionSelection) {
     const rows = await query(
         `SELECT raw, event_id, ts, fecha, nparte, modelo, lot_no, linea, lado, resultado,
-                CASE
-                    WHEN raw IN (${placeholders})
-                      OR lot_no IN (${placeholders})
-                      OR event_id IN (${placeholders})
-                    THEN 0
-                    ELSE 1
-                END AS match_rank
          FROM history_prueba_electrica
-         WHERE raw IN (${placeholders})
-            OR lot_no IN (${placeholders})
-            OR event_id IN (${placeholders})
-            OR nparte IN (${placeholders})
-         ORDER BY match_rank ASC, ts DESC
+         WHERE BINARY raw = BINARY ?
+         ORDER BY ts DESC
          LIMIT 1`,
-        [
-            ...searchValues,
-            ...searchValues,
-            ...searchValues,
-            ...searchValues,
-            ...searchValues,
-            ...searchValues,
-            ...searchValues
-        ]
+        [barcode]
     );
 
     const display = rows[0] || null;
@@ -741,25 +721,6 @@ async function validateDisplayQualityStatus(barcode, partNumber, productionSelec
     }
 
     return { valid: true, quality };
-}
-
-function getDisplaySearchValues(barcode, partNumber) {
-    const values = [];
-    addUniqueValue(values, barcode);
-    addUniqueValue(values, partNumber);
-
-    for (const segment of String(barcode || '').split('ñ')) {
-        addUniqueValue(values, segment);
-    }
-
-    return values;
-}
-
-function addUniqueValue(values, value) {
-    const normalized = String(value || '').trim();
-    if (normalized && !values.includes(normalized)) {
-        values.push(normalized);
-    }
 }
 
 function normalizeStatus(value) {
