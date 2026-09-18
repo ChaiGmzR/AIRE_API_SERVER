@@ -672,7 +672,7 @@ async function validateMainPcbQualityStatus(barcode) {
 
 async function validateDisplayQualityStatus(barcode, productionSelection) {
     const rows = await query(
-        `SELECT raw, event_id, ts, fecha, nparte, modelo, lot_no, linea, lado, resultado,
+        `SELECT raw, event_id, ts, fecha, nparte, modelo, lot_no, linea, lado, resultado
          FROM history_prueba_electrica
          WHERE BINARY raw = BINARY ?
          ORDER BY ts DESC
