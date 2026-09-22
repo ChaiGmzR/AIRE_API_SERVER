@@ -6,7 +6,12 @@ const {
     query,
     testConnection
 } = require('../db');
-const { extractPartNumber, validateBoxId, validateBarCode } = require('../utils/partNumber');
+const {
+    extractPartNumber,
+    parseBarcode,
+    validateBoxId,
+    validateBarCode
+} = require('../utils/partNumber');
 const { getShiftTimeRange, formatDateTime } = require('../utils/shifts');
 
 const router = express.Router();
@@ -44,20 +49,25 @@ router.post('/', async (req, res) => {
             return res.status(400).json({ error: boxValidation.error });
         }
 
-        const barcodeValidation = validateBarCode(barcode);
-        if (!barcodeValidation.valid) {
-            return res.status(400).json({ error: barcodeValidation.error });
-        }
-
         const productionValidation = validateProductionSelection(req.body);
         if (!productionValidation.valid) {
             return res.status(400).json({ error: productionValidation.error });
         }
 
+        const barcodeValidation = validateBarCode(barcode, {
+            productionType: productionValidation.selection.productionType
+        });
+        if (!barcodeValidation.valid) {
+            return res.status(400).json({ error: barcodeValidation.error });
+        }
+
         const existingBoxScans = validateOnly
             ? []
             : pendingBoxes.get(boxValidation.boxId) || [];
-        const duplicate = existingBoxScans.some(scan => scan.serial === barcodeValidation.barcode);
+        const duplicate = existingBoxScans.some(
+            scan => scan.barcodeComparisonKey === barcodeValidation.comparisonKey ||
+                getBarcodeComparisonKey(scan.serial) === barcodeValidation.comparisonKey
+        );
         if (duplicate) {
             return res.status(409).json({ error: 'Este BarCode ya fue escaneado en esta caja' });
         }
@@ -75,7 +85,8 @@ router.post('/', async (req, res) => {
         const testStatus = await validateQualityStatus(
             barcodeValidation.barcode,
             barcodeValidation.partNumber,
-            productionValidation.selection
+            productionValidation.selection,
+            barcodeValidation.barcodeType
         );
         if (!testStatus.valid) {
             return res.status(409).json({
@@ -96,6 +107,8 @@ router.post('/', async (req, res) => {
             productionType: productionValidation.selection.productionType,
             productionLabel: productionValidation.selection.productionLabel,
             lineCode: productionValidation.selection.lineCode,
+            barcodeType: barcodeValidation.barcodeType,
+            barcodeComparisonKey: barcodeValidation.comparisonKey,
             firstScan: formatDateTime(now),
             scanDate: now
         };
@@ -318,7 +331,9 @@ router.delete('/box/:boxCode/scan/:barcode', async (req, res) => {
             });
         }
 
-        const scanIndex = boxScans.findIndex(scan => scan.serial === barcodeValidation.barcode);
+        const scanIndex = boxScans.findIndex(
+            scan => getBarcodeComparisonKey(scan.serial) === barcodeValidation.comparisonKey
+        );
         if (scanIndex === -1) {
             const currentPartNumber = boxScans[0]?.partNumber || null;
             return res.json({
@@ -440,7 +455,9 @@ function buildBoxScansForSend(boxCode, body = {}, pendingScans, selection) {
         const rawBarcode = typeof item === 'string'
             ? item
             : item?.barcode || item?.serial;
-        const barcodeValidation = validateBarCode(rawBarcode);
+        const barcodeValidation = validateBarCode(rawBarcode, {
+            productionType: selection.productionType
+        });
 
         if (!barcodeValidation.valid) {
             throw createHttpError(400, barcodeValidation.error);
@@ -448,7 +465,10 @@ function buildBoxScansForSend(boxCode, body = {}, pendingScans, selection) {
 
         if (expectedPartNumber === null) {
             expectedPartNumber = barcodeValidation.partNumber;
-        } else if (expectedPartNumber !== barcodeValidation.partNumber) {
+        } else if (
+            String(expectedPartNumber).toUpperCase() !==
+            String(barcodeValidation.partNumber).toUpperCase()
+        ) {
             throw createConflictError(
                 `Numero de parte distinto. Esperado ${expectedPartNumber}, recibido ${barcodeValidation.partNumber}`
             );
@@ -463,6 +483,8 @@ function buildBoxScansForSend(boxCode, body = {}, pendingScans, selection) {
             productionType: selection.productionType,
             productionLabel: selection.productionLabel,
             lineCode: selection.lineCode,
+            barcodeType: barcodeValidation.barcodeType,
+            barcodeComparisonKey: barcodeValidation.comparisonKey,
             firstScan: formatDateTime(scanDate),
             scanDate
         });
@@ -473,7 +495,12 @@ function buildBoxScansForSend(boxCode, body = {}, pendingScans, selection) {
 
 async function validateBoxScansQuality(boxScans, selection) {
     for (const scan of boxScans) {
-        const quality = await validateQualityStatus(scan.serial, scan.partNumber, selection);
+        const quality = await validateQualityStatus(
+            scan.serial,
+            scan.partNumber,
+            selection,
+            scan.barcodeType || parseBarcode(scan.serial)?.type
+        );
         if (!quality.valid) {
             return quality;
         }
@@ -520,6 +547,10 @@ function renumberBoxScans(boxScans) {
     boxScans.forEach((scan, index) => {
         scan.id = index + 1;
     });
+}
+
+function getBarcodeComparisonKey(barcode) {
+    return parseBarcode(barcode)?.comparisonKey || String(barcode || '').trim().toUpperCase();
 }
 
 function validateProductionSelection(body = {}) {
@@ -596,7 +627,7 @@ function validateBoxPartNumber(boxScans, partNumber) {
     }
 
     const expectedPartNumber = boxScans[0].partNumber;
-    if (expectedPartNumber === partNumber) {
+    if (String(expectedPartNumber).toUpperCase() === String(partNumber).toUpperCase()) {
         return { valid: true };
     }
 
@@ -606,9 +637,9 @@ function validateBoxPartNumber(boxScans, partNumber) {
     };
 }
 
-async function validateQualityStatus(barcode, partNumber, productionSelection) {
+async function validateQualityStatus(barcode, partNumber, productionSelection, barcodeType) {
     if (productionSelection.productionType === 'DISPLAY') {
-        return validateDisplayQualityStatus(barcode, productionSelection);
+        return validateDisplayQualityStatus(barcode, productionSelection, barcodeType);
     }
 
     return validateMainPcbQualityStatus(barcode);
@@ -619,7 +650,7 @@ async function validateMainPcbQualityStatus(barcode) {
         query(
             `SELECT resultado, ts
              FROM history_ict
-             WHERE barcode = ?
+             WHERE LOWER(barcode) = LOWER(?)
              ORDER BY ts DESC
              LIMIT 1`,
             [barcode]
@@ -627,7 +658,7 @@ async function validateMainPcbQualityStatus(barcode) {
         query(
             `SELECT final_result, COALESCE(end_at, start_at, file_modified_at, created_at) AS test_ts
              FROM fct_test_results
-             WHERE serial_number = ?
+             WHERE LOWER(serial_number) = LOWER(?)
              ORDER BY COALESCE(end_at, start_at, file_modified_at, created_at) DESC
              LIMIT 1`,
             [barcode]
@@ -670,11 +701,12 @@ async function validateMainPcbQualityStatus(barcode) {
     return { valid: true, quality };
 }
 
-async function validateDisplayQualityStatus(barcode, productionSelection) {
+async function validateDisplayQualityStatus(barcode, productionSelection, barcodeType) {
+    const isProductionBarcode = barcodeType === 'PRODUCTION';
     const rows = await query(
         `SELECT raw, event_id, ts, fecha, nparte, modelo, lot_no, linea, lado, resultado
          FROM history_prueba_electrica
-         WHERE BINARY raw = BINARY ?
+         WHERE ${isProductionBarcode ? 'LOWER(raw) = LOWER(?)' : 'BINARY raw = BINARY ?'}
          ORDER BY ts DESC
          LIMIT 1`,
         [barcode]
