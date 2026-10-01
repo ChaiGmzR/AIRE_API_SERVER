@@ -1,3 +1,6 @@
+
+
+
 const express = require('express');
 const { constants } = require('fs');
 const fs = require('fs/promises');
@@ -7,15 +10,25 @@ const {
     testConnection
 } = require('../db');
 const {
+    query: querySqlServer,
+    testConnection: testSqlServerConnection
+} = require('../sqlserver');
+const {
     extractPartNumber,
     parseBarcode,
     validateBoxId,
     validateBarCode
 } = require('../utils/partNumber');
-const { getShiftTimeRange, formatDateTime } = require('../utils/shifts');
+const {
+    getShiftTimeRange,
+    getShiftIntervals,
+    formatDateTime
+} = require('../utils/shifts');
 
+/* Scan Routes */
 const router = express.Router();
 
+/* Global Variables */
 const DEFAULT_BOX_DATA_PATH = '\\\\192.168.1.144\\lg-pws\\TDATA\\BOX\\DATA';
 const BOX_DATA_PATH = process.env.BOX_DATA_PATH || DEFAULT_BOX_DATA_PATH;
 const HISTORY_RETENTION_MS = 24 * 60 * 60 * 1000;
@@ -242,6 +255,31 @@ router.post('/box/:boxCode/send', async (req, res) => {
 
         console.error('Error generating box file:', error);
         res.status(500).json({ error: 'Error al generar el archivo BOX', details: error.message });
+    }
+});
+
+/**
+ * GET /api/scans/hourly
+ * Return HxH counts for the active shift and selected production scope.
+ * Legacy rows without production_type/line_code are intentionally excluded.
+ */
+router.get('/hourly', async (req, res) => {
+    try {
+        const productionValidation = validateProductionSelection(req.query);
+        if (!productionValidation.valid) {
+            return res.status(400).json({ error: productionValidation.error });
+        }
+
+        const hourly = await getHourlyCountsForResponse(
+            productionValidation.selection
+        );
+        res.json(hourly);
+    } catch (error) {
+        console.error('Error getting hourly counts:', error);
+        res.status(500).json({
+            error: 'Error al obtener el conteo HxH',
+            details: error.message
+        });
     }
 });
 
@@ -646,39 +684,59 @@ async function validateQualityStatus(barcode, partNumber, productionSelection, b
 }
 
 async function validateMainPcbQualityStatus(barcode) {
-    const [ictRows, fctRows] = await Promise.all([
-        query(
-            `SELECT resultado, ts
-             FROM history_ict
-             WHERE LOWER(barcode) = LOWER(?)
-             ORDER BY ts DESC
-             LIMIT 1`,
-            [barcode]
-        ),
-        query(
-            `SELECT final_result, COALESCE(end_at, start_at, file_modified_at, created_at) AS test_ts
-             FROM fct_test_results
-             WHERE LOWER(serial_number) = LOWER(?)
-             ORDER BY COALESCE(end_at, start_at, file_modified_at, created_at) DESC
-             LIMIT 1`,
-            [barcode]
-        )
-    ]);
+    const rows = await querySqlServer(
+        `SELECT
+             ict.Ict_Result,
+             ict.Ict_Inspdate,
+             fct.Fct_Result,
+             fct.Fct_Inspdate
+         FROM (SELECT 1 AS marker) AS source
+         OUTER APPLY (
+             SELECT TOP (1) Ict_Result, Ict_Inspdate
+             FROM [PWSDB].[dbo].[TBL_INSPRSLT]
+             WHERE UPPER(LTRIM(RTRIM(Barcode_Id))) =
+                   UPPER(LTRIM(RTRIM(@barcode)))
+               AND Ict_Inspdate IS NOT NULL
+             ORDER BY Ict_Inspdate DESC
+         ) AS ict
+         OUTER APPLY (
+             SELECT TOP (1) Fct_Result, Fct_Inspdate
+             FROM [PWSDB].[dbo].[TBL_INSPRSLT]
+             WHERE UPPER(LTRIM(RTRIM(Barcode_Id))) =
+                   UPPER(LTRIM(RTRIM(@barcode)))
+               AND Fct_Inspdate IS NOT NULL
+             ORDER BY Fct_Inspdate DESC
+         ) AS fct`,
+        { barcode }
+    );
 
-    const ict = ictRows[0] || null;
-    const fct = fctRows[0] || null;
+    const result = rows[0] || null;
+    const ict = result?.Ict_Inspdate
+        ? {
+            resultado: result.Ict_Result,
+            ts: result.Ict_Inspdate
+        }
+        : null;
+    const fct = result?.Fct_Inspdate
+        ? {
+            final_result: result.Fct_Result,
+            test_ts: result.Fct_Inspdate
+        }
+        : null;
     const quality = {
         productionType: 'MAIN_PCB',
         ict: {
             found: Boolean(ict),
             status: ict?.resultado || null,
-            timestamp: ict?.ts || null
+            timestamp: ict?.ts || null,
+            source: 'PWSDB.dbo.TBL_INSPRSLT'
         },
         fct: {
             found: Boolean(fct),
             status: fct ? normalizeFctStatus(fct.final_result) : null,
             rawStatus: fct?.final_result || null,
-            timestamp: fct?.test_ts || null
+            timestamp: fct?.test_ts || null,
+            source: 'PWSDB.dbo.TBL_INSPRSLT'
         }
     };
 
@@ -876,6 +934,101 @@ async function getShiftCountForResponse(partNumber) {
     }
 }
 
+let boxScanScopeColumnsAvailable;
+
+async function getHourlyCountsForResponse(selection) {
+    const shiftInfo = getShiftTimeRange();
+    const intervals = getShiftIntervals();
+    const scans = [];
+    const scopeColumnsAvailable = await hasBoxScanScopeColumns();
+
+    for (const scan of getAllKnownScans()) {
+        if (
+            scan.productionType === selection.productionType &&
+            scan.lineCode === selection.lineCode &&
+            scan.scanDate >= shiftInfo.startDate &&
+            scan.scanDate < shiftInfo.endDate
+        ) {
+            scans.push({
+                serial: scan.serial,
+                boxCode: scan.boxCode,
+                scanDate: scan.scanDate
+            });
+        }
+    }
+
+    if (scopeColumnsAvailable) {
+        try {
+            const rows = await query(
+                `SELECT serial, box_code, first_scan, production_type, line_code
+                 FROM box_scans
+                 WHERE first_scan >= ? AND first_scan < ?
+                   AND production_type = ? AND line_code = ?`,
+                [
+                    shiftInfo.startDate,
+                    shiftInfo.endDate,
+                    selection.productionType,
+                    selection.lineCode
+                ]
+            );
+
+            for (const row of rows) {
+                const scanDate = parseScanDate(row.first_scan);
+                scans.push({
+                    serial: row.serial,
+                    boxCode: row.box_code,
+                    scanDate
+                });
+            }
+        } catch (error) {
+            console.error('Error reading scoped box scans for HxH:', error);
+        }
+    }
+
+    const counts = intervals.map((interval) => ({
+        label: interval.label,
+        start: interval.startDate.toISOString(),
+        end: interval.endDate.toISOString(),
+        count: scans.filter(
+            (scan) =>
+                scan.scanDate >= interval.startDate &&
+                scan.scanDate < interval.endDate
+        ).length
+    }));
+
+    return {
+        shift: shiftInfo.shift,
+        shiftStart: shiftInfo.startStr,
+        shiftEnd: shiftInfo.endStr,
+        productionType: selection.productionType,
+        lineCode: selection.lineCode,
+        legacyRowsExcluded: !scopeColumnsAvailable,
+        intervals: counts,
+        total: counts.reduce((sum, interval) => sum + interval.count, 0)
+    };
+}
+
+async function hasBoxScanScopeColumns() {
+    if (boxScanScopeColumnsAvailable !== undefined) {
+        return boxScanScopeColumnsAvailable;
+    }
+
+    try {
+        const rows = await query(
+            `SELECT COLUMN_NAME
+             FROM INFORMATION_SCHEMA.COLUMNS
+             WHERE TABLE_SCHEMA = DATABASE()
+               AND TABLE_NAME = 'box_scans'
+               AND COLUMN_NAME IN ('production_type', 'line_code')`
+        );
+        boxScanScopeColumnsAvailable = rows.length === 2;
+    } catch (_) {
+        boxScanScopeColumnsAvailable = false;
+    }
+
+    return boxScanScopeColumnsAvailable;
+}
+
 function getAllKnownScans() {
     const pending = Array.from(pendingBoxes.values()).flat();
     return pending.concat(scanHistory);
@@ -893,15 +1046,18 @@ function pruneHistory() {
 
 async function getSystemStatus() {
     const shiftInfo = getShiftTimeRange();
-    const [share, database] = await Promise.all([
+    const [share, database, mainQualityDatabase] = await Promise.all([
         testShareAccess(),
-        testConnection()
+        testConnection(),
+        testSqlServerConnection()
     ]);
 
     return {
-        connected: share.connected && database.connected,
+        connected:
+            share.connected && database.connected && mainQualityDatabase.connected,
         share,
         database,
+        mainQualityDatabase,
         shift: shiftInfo.shift,
         shiftStart: shiftInfo.startStr,
         shiftEnd: shiftInfo.endStr,

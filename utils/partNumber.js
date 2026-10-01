@@ -82,14 +82,14 @@ function validateBoxId(boxId) {
         return { valid: false, error: 'El Box Id es requerido' };
     }
 
-    const trimmed = boxId.trim();
+    const normalized = boxId.trim().toUpperCase();
 
     // Basic validation: should start with letters and contain numbers
-    if (!/^[A-Z]{2,4}\d{10,15}$/.test(trimmed)) {
+    if (!/^[A-Z]{2,4}\d{10,15}$/.test(normalized)) {
         return { valid: false, error: 'Formato de Box Id invalido' };
     }
 
-    return { valid: true, boxId: trimmed };
+    return { valid: true, boxId: normalized };
 }
 
 /**

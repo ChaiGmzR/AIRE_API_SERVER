@@ -93,6 +93,37 @@ function getShiftTimeRange(date = new Date()) {
 }
 
 /**
+ * Return the one-hour buckets for the active shift. The final bucket may be
+ * shorter than one hour when the shift ends at 07:30 or 22:30.
+ */
+function getShiftIntervals(date = new Date()) {
+    const { startDate, endDate } = getShiftTimeRange(date);
+    const intervals = [];
+    let cursor = new Date(startDate.getTime());
+
+    while (cursor < endDate) {
+        const next = new Date(
+            Math.min(cursor.getTime() + 60 * 60 * 1000, endDate.getTime())
+        );
+
+        intervals.push({
+            startDate: new Date(cursor.getTime()),
+            endDate: next,
+            label: `${formatClock(cursor)}-${formatClock(next)}`
+        });
+
+        cursor = next;
+    }
+
+    return intervals;
+}
+
+function formatClock(date) {
+    const pad = (n) => n.toString().padStart(2, '0');
+    return `${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
+
+/**
  * Format date as MySQL DATETIME string
  */
 function formatDateTime(date) {
@@ -113,6 +144,7 @@ module.exports = {
     SHIFTS,
     getCurrentShift,
     getShiftTimeRange,
+    getShiftIntervals,
     formatDateTime,
     getCurrentDateStr
 };

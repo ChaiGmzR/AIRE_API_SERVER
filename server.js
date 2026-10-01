@@ -66,6 +66,7 @@ app.get('/', (req, res) => {
             'GET /api/version - Get backend version',
             'POST /api/scans - Validate a scan using selected production line',
             'POST /api/scans/box/:boxCode/send - Generate BOX TXT file',
+            'GET /api/scans/hourly - Get HxH counts for the selected line and flow',
             'GET /api/scans/count/:partNumber - Get persisted shift count',
             'GET /api/scans/box/:boxCode - Get pending box scans',
             'DELETE /api/scans/box/:boxCode/scan/:barcode - Delete one pending scan',
@@ -88,6 +89,7 @@ function startServer() {
             console.log(`\n📡 API Endpoints:`);
             console.log(`   POST   /api/scans                  - Validate a scan using selected production line`);
             console.log(`   POST   /api/scans/box/:code/send   - Generate BOX TXT file`);
+            console.log(`   GET    /api/scans/hourly            - Get HxH counts for selected line and flow`);
             console.log(`   GET    /api/scans/count/:pn        - Get persisted shift count`);
             console.log(`   GET    /api/scans/box/:code        - Get pending box scans`);
             console.log(`   DELETE /api/scans/box/:code/scan/:barcode - Delete one pending scan`);
