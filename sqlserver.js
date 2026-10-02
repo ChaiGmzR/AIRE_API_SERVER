@@ -1,5 +1,8 @@
 const sql = require('mssql');
-require('dotenv').config();
+const path = require('path');
+
+// Keep SQL Server configuration tied to this backend, not to process.cwd().
+require('dotenv').config({ path: path.join(__dirname, '.env') });
 
 let poolPromise;
 
@@ -13,7 +16,7 @@ function getPool() {
             password: requiredEnv('MSSQL_PASSWORD'),
             pool: {
                 max: parsePositiveInt(process.env.MSSQL_CONNECTION_LIMIT || '10'),
-                min: 0,
+                min: parsePositiveInt(process.env.MSSQL_CONNECTION_MIN || '1'),
                 idleTimeoutMillis: 30000
             },
             options: {
@@ -35,6 +38,10 @@ function getPool() {
     }
 
     return poolPromise;
+}
+
+async function warmup() {
+    return testConnection();
 }
 
 async function query(queryText, params = {}) {
@@ -103,5 +110,6 @@ function parsePositiveInt(value) {
 module.exports = {
     query,
     testConnection,
+    warmup,
     closePool
 };

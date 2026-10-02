@@ -6,7 +6,10 @@ ensureDependencies();
 
 const express = require('express');
 const cors = require('cors');
-require('dotenv').config();
+// Load configuration from the backend directory even when a process manager
+// starts Node with a different current working directory.
+require('dotenv').config({ path: path.join(__dirname, '.env') });
+const { warmup: warmupSqlServer } = require('./sqlserver');
 
 const scansRouter = require('./routes/scans');
 const packageInfo = require('./package.json');
@@ -97,6 +100,14 @@ function startServer() {
             console.log(`   GET    /api/scans/status           - Get share access status`);
             console.log(`   GET    /health                     - Process health check`);
             console.log(`   GET    /ready                      - Dependency readiness check`);
+
+            warmupSqlServer().then((result) => {
+                if (result.connected) {
+                    console.log('   SQL Server connection pool warmed up');
+                } else {
+                    console.warn(`   SQL Server warmup unavailable: ${result.error}`);
+                }
+            });
 
             if (process.env.WRITE_PORT_FILE === 'true') {
                 const fs = require('fs');

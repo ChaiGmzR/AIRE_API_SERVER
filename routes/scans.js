@@ -21,6 +21,7 @@ const {
 } = require('../utils/partNumber');
 const {
     getShiftTimeRange,
+    getShiftTimeRangeForShift,
     getShiftIntervals,
     formatDateTime
 } = require('../utils/shifts');
@@ -142,8 +143,7 @@ router.post('/', async (req, res) => {
                 scanTime: scan.firstScan
             },
             counts: {
-                box: validateOnly ? null : boxScans.length,
-                shift: await getShiftCountForResponse(scan.partNumber)
+                box: validateOnly ? null : boxScans.length
             }
         });
     } catch (error) {
@@ -270,8 +270,28 @@ router.get('/hourly', async (req, res) => {
             return res.status(400).json({ error: productionValidation.error });
         }
 
+        const requestedShift = req.query.shift
+            ? String(req.query.shift).trim().toUpperCase()
+            : null;
+        const requestedDate = parseRequestedShiftDate(req.query.date);
+        if (req.query.date && !requestedDate) {
+            return res.status(400).json({
+                error: 'Fecha de turno invalida. Use el formato YYYY-MM-DD'
+            });
+        }
+        if (requestedShift && !['DAY', 'OVERTIME', 'NIGHT'].includes(requestedShift)) {
+            return res.status(400).json({ error: 'Turno invalido' });
+        }
+        if (Boolean(requestedShift) !== Boolean(requestedDate)) {
+            return res.status(400).json({
+                error: 'Para consultar un turno historico se requieren fecha y turno'
+            });
+        }
+
         const hourly = await getHourlyCountsForResponse(
-            productionValidation.selection
+            productionValidation.selection,
+            requestedShift,
+            requestedDate
         );
         res.json(hourly);
     } catch (error) {
@@ -684,6 +704,7 @@ async function validateQualityStatus(barcode, partNumber, productionSelection, b
 }
 
 async function validateMainPcbQualityStatus(barcode) {
+    const normalizedBarcode = String(barcode || '').trim().toUpperCase();
     const rows = await querySqlServer(
         `SELECT
              ict.Ict_Result,
@@ -694,20 +715,18 @@ async function validateMainPcbQualityStatus(barcode) {
          OUTER APPLY (
              SELECT TOP (1) Ict_Result, Ict_Inspdate
              FROM [PWSDB].[dbo].[TBL_INSPRSLT]
-             WHERE UPPER(LTRIM(RTRIM(Barcode_Id))) =
-                   UPPER(LTRIM(RTRIM(@barcode)))
+             WHERE Barcode_Id = @barcode
                AND Ict_Inspdate IS NOT NULL
              ORDER BY Ict_Inspdate DESC
          ) AS ict
          OUTER APPLY (
              SELECT TOP (1) Fct_Result, Fct_Inspdate
              FROM [PWSDB].[dbo].[TBL_INSPRSLT]
-             WHERE UPPER(LTRIM(RTRIM(Barcode_Id))) =
-                   UPPER(LTRIM(RTRIM(@barcode)))
+             WHERE Barcode_Id = @barcode
                AND Fct_Inspdate IS NOT NULL
              ORDER BY Fct_Inspdate DESC
          ) AS fct`,
-        { barcode }
+        { barcode: normalizedBarcode }
     );
 
     const result = rows[0] || null;
@@ -936,9 +955,17 @@ async function getShiftCountForResponse(partNumber) {
 
 let boxScanScopeColumnsAvailable;
 
-async function getHourlyCountsForResponse(selection) {
-    const shiftInfo = getShiftTimeRange();
-    const intervals = getShiftIntervals();
+async function getHourlyCountsForResponse(
+    selection,
+    shiftCode = null,
+    shiftDate = null
+) {
+    const shiftInfo = shiftCode
+        ? getShiftTimeRangeForShift(shiftCode, shiftDate)
+        : getShiftTimeRange();
+    const intervals = shiftCode
+        ? getShiftIntervals(shiftDate, shiftCode)
+        : getShiftIntervals();
     const scans = [];
     const scopeColumnsAvailable = await hasBoxScanScopeColumns();
 
@@ -997,7 +1024,10 @@ async function getHourlyCountsForResponse(selection) {
     }));
 
     return {
+        shiftCode: shiftInfo.shiftCode,
         shift: shiftInfo.shift,
+        shiftLabel: formatShiftLabel(shiftInfo.shiftCode),
+        shiftDate: formatDateOnly(shiftInfo.startDate),
         shiftStart: shiftInfo.startStr,
         shiftEnd: shiftInfo.endStr,
         productionType: selection.productionType,
@@ -1006,6 +1036,43 @@ async function getHourlyCountsForResponse(selection) {
         intervals: counts,
         total: counts.reduce((sum, interval) => sum + interval.count, 0)
     };
+}
+
+function parseRequestedShiftDate(value) {
+    if (value === undefined || value === null || value === '') {
+        return null;
+    }
+
+    const text = String(value).trim();
+    const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(text);
+    if (!match) return null;
+
+    const year = Number(match[1]);
+    const month = Number(match[2]);
+    const day = Number(match[3]);
+    const date = new Date(year, month - 1, day);
+    if (
+        date.getFullYear() !== year ||
+        date.getMonth() !== month - 1 ||
+        date.getDate() !== day
+    ) {
+        return null;
+    }
+
+    return date;
+}
+
+function formatDateOnly(date) {
+    const pad = (value) => value.toString().padStart(2, '0');
+    return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
+}
+
+function formatShiftLabel(shiftCode) {
+    return {
+        DAY: 'Dia',
+        OVERTIME: 'T.E.',
+        NIGHT: 'Noche'
+    }[shiftCode] || shiftCode;
 }
 
 async function hasBoxScanScopeColumns() {

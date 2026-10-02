@@ -9,6 +9,7 @@
 
 const SHIFTS = {
     DAY: {
+        code: 'DAY',
         name: 'Day',
         startHour: 7,
         startMinute: 30,
@@ -16,6 +17,7 @@ const SHIFTS = {
         endMinute: 30
     },
     OVERTIME: {
+        code: 'OVERTIME',
         name: 'Overtime',
         startHour: 17,
         startMinute: 30,
@@ -23,6 +25,7 @@ const SHIFTS = {
         endMinute: 30
     },
     NIGHT: {
+        code: 'NIGHT',
         name: 'Night',
         startHour: 22,
         startMinute: 30,
@@ -84,6 +87,45 @@ function getShiftTimeRange(date = new Date()) {
     }
 
     return {
+        shiftCode: shift.code,
+        shift: shift.name,
+        startDate,
+        endDate,
+        startStr: formatDateTime(startDate),
+        endStr: formatDateTime(endDate)
+    };
+}
+
+/**
+ * Get a specific shift using its start date. For NIGHT, the date is the date
+ * on which the shift starts at 22:30.
+ */
+function getShiftTimeRangeForShift(shiftCode, date = new Date()) {
+    const normalizedCode = String(shiftCode || '').trim().toUpperCase();
+    const shift = SHIFTS[normalizedCode];
+    if (!shift) {
+        throw new Error(`Invalid shift: ${shiftCode}`);
+    }
+
+    const year = date.getFullYear();
+    const month = date.getMonth();
+    const day = date.getDate();
+    let startDate;
+    let endDate;
+
+    if (normalizedCode === 'DAY') {
+        startDate = new Date(year, month, day, 7, 30, 0);
+        endDate = new Date(year, month, day, 17, 30, 0);
+    } else if (normalizedCode === 'OVERTIME') {
+        startDate = new Date(year, month, day, 17, 30, 0);
+        endDate = new Date(year, month, day, 22, 30, 0);
+    } else {
+        startDate = new Date(year, month, day, 22, 30, 0);
+        endDate = new Date(year, month, day + 1, 7, 30, 0);
+    }
+
+    return {
+        shiftCode: normalizedCode,
         shift: shift.name,
         startDate,
         endDate,
@@ -96,8 +138,10 @@ function getShiftTimeRange(date = new Date()) {
  * Return the one-hour buckets for the active shift. The final bucket may be
  * shorter than one hour when the shift ends at 07:30 or 22:30.
  */
-function getShiftIntervals(date = new Date()) {
-    const { startDate, endDate } = getShiftTimeRange(date);
+function getShiftIntervals(date = new Date(), shiftCode = null) {
+    const { startDate, endDate } = shiftCode
+        ? getShiftTimeRangeForShift(shiftCode, date)
+        : getShiftTimeRange(date);
     const intervals = [];
     let cursor = new Date(startDate.getTime());
 
@@ -144,6 +188,7 @@ module.exports = {
     SHIFTS,
     getCurrentShift,
     getShiftTimeRange,
+    getShiftTimeRangeForShift,
     getShiftIntervals,
     formatDateTime,
     getCurrentDateStr
