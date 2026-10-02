@@ -6,6 +6,7 @@ const { constants } = require('fs');
 const fs = require('fs/promises');
 const path = require('path');
 const {
+    getPool,
     query,
     testConnection
 } = require('../db');
@@ -159,7 +160,11 @@ router.post('/', async (req, res) => {
 router.post('/box/:boxCode/send', async (req, res) => {
     let targetPath = null;
     let temporaryPath = null;
+    let targetName = null;
     let fileCreated = false;
+    let databaseInserted = false;
+    let persistedScans = [];
+    let persistedBoxCode = null;
 
     try {
         const { boxCode } = req.params;
@@ -168,6 +173,7 @@ router.post('/box/:boxCode/send', async (req, res) => {
         if (!boxValidation.valid) {
             return res.status(400).json({ error: boxValidation.error });
         }
+        persistedBoxCode = boxValidation.boxId;
 
         const pendingScans = pendingBoxes.get(boxValidation.boxId) || [];
         const requestBody = req.body && typeof req.body === 'object' ? req.body : {};
@@ -197,29 +203,24 @@ router.post('/box/:boxCode/send', async (req, res) => {
             });
         }
 
-        const existingBoxes = await query(
-            `SELECT box_code
-             FROM box_scans
-             WHERE box_code = ?
-             LIMIT 1`,
-            [boxValidation.boxId]
-        );
-        if (existingBoxes.length > 0) {
-            return res.status(409).json({
-                error: `El Box Id ${boxValidation.boxId} ya fue registrado previamente`
-            });
-        }
-
         await fs.access(BOX_DATA_PATH, constants.W_OK);
 
         const sendDate = new Date();
         const lastScan = formatDateTime(sendDate);
         targetPath = await getAvailableBoxFilePath(boxValidation.boxId, sendDate);
-        const targetName = path.win32.basename(targetPath);
+        targetName = path.win32.basename(targetPath);
         temporaryPath = `${targetPath}.writing-${process.pid}-${Date.now()}`;
         const content = buildBoxFileContent(boxScans, lastScan);
 
         await fs.writeFile(temporaryPath, content, 'ascii');
+        await insertBoxScans(
+            boxScans,
+            targetName,
+            sendDate,
+            boxValidation.boxId
+        );
+        databaseInserted = true;
+        persistedScans = boxScans;
         await fs.rename(temporaryPath, targetPath);
         fileCreated = true;
 
@@ -244,6 +245,13 @@ router.post('/box/:boxCode/send', async (req, res) => {
     } catch (error) {
         if (temporaryPath && !fileCreated) {
             await removeFileIfExists(temporaryPath);
+        }
+        if (databaseInserted && !fileCreated) {
+            await removeInsertedBoxScans(
+                persistedScans,
+                targetName,
+                persistedBoxCode
+            );
         }
         if (targetPath && fileCreated) {
             await removeFileIfExists(targetPath);
@@ -950,6 +958,79 @@ async function getShiftCountForResponse(partNumber) {
         return persistedCount + pendingCount;
     } catch (_) {
         return getShiftCount(partNumber);
+    }
+}
+
+async function insertBoxScans(scans, sourceFile, sendDate, boxCode) {
+    const pool = getPool();
+    const connection = await pool.getConnection();
+    const rows = scans.map((scan) => [
+        scan.serial,
+        boxCode,
+        scan.firstScan,
+        formatDateTime(sendDate),
+        sourceFile,
+        formatDateOnly(sendDate),
+        scan.productionType,
+        scan.lineCode
+    ]);
+
+    try {
+        await connection.beginTransaction();
+
+        const [existingBoxes] = await connection.execute(
+            `SELECT box_code
+             FROM box_scans
+             WHERE box_code = ?
+             LIMIT 1
+             FOR UPDATE`,
+            [boxCode]
+        );
+        if (existingBoxes.length > 0) {
+            const error = new Error(`El Box Id ${boxCode} ya fue registrado previamente`);
+            error.statusCode = 409;
+            throw error;
+        }
+
+        await connection.query(
+            `INSERT INTO box_scans
+                (serial, box_code, first_scan, last_scan, source_file,
+                 folder_date, production_type, line_code)
+             VALUES ?`,
+            [rows]
+        );
+        await connection.commit();
+    } catch (error) {
+        await connection.rollback().catch(() => {});
+        throw error;
+    } finally {
+        connection.release();
+    }
+}
+
+async function removeInsertedBoxScans(scans, sourceFile, boxCode) {
+    if (!sourceFile || !boxCode || scans.length === 0) return;
+
+    const pool = getPool();
+    const connection = await pool.getConnection();
+    try {
+        await connection.beginTransaction();
+        for (const scan of scans) {
+            await connection.execute(
+                `DELETE FROM box_scans
+                 WHERE serial = ?
+                   AND box_code = ?
+                   AND first_scan = ?
+                   AND source_file = ?`,
+                [scan.serial, boxCode, scan.firstScan, sourceFile]
+            );
+        }
+        await connection.commit();
+    } catch (error) {
+        await connection.rollback().catch(() => {});
+        console.error('Error reverting box_scans after TXT failure:', error);
+    } finally {
+        connection.release();
     }
 }
 
