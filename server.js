@@ -12,6 +12,7 @@ require('dotenv').config({ path: path.join(__dirname, '.env') });
 const { warmup: warmupSqlServer } = require('./sqlserver');
 
 const scansRouter = require('./routes/scans');
+const updatesRouter = require('./routes/updates');
 const packageInfo = require('./package.json');
 
 const app = express();
@@ -27,6 +28,7 @@ app.use(express.json());
 
 // Routes
 app.use('/api/scans', scansRouter);
+app.use('/api/updates', updatesRouter);
 
 // Health check endpoint
 app.get('/health', async (req, res) => {
@@ -51,7 +53,8 @@ app.get('/ready', async (req, res) => {
     });
 });
 
-// Version endpoint for backend diagnostics. The Windows client validates itself against GitHub.
+// Version endpoint for backend diagnostics. The Windows client validates against
+// the latest installer exposed by /api/updates/latest.
 app.get('/api/version', (req, res) => {
     res.json({
         name: 'Ilsan Packing System API',
@@ -67,6 +70,8 @@ app.get('/', (req, res) => {
         version: appVersion,
         endpoints: [
             'GET /api/version - Get backend version',
+            'GET /api/updates/latest - Get latest client installer from the update share',
+            'GET /api/updates/download/:version - Download a client installer',
             'POST /api/scans - Validate a scan using selected production line',
             'POST /api/scans/box/:boxCode/send - Generate BOX TXT file',
             'GET /api/scans/hourly - Get HxH counts for the selected line and flow',
