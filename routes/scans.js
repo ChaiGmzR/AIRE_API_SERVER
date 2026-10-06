@@ -1047,10 +1047,13 @@ async function getHourlyCountsForResponse(
     const intervals = shiftCode
         ? getShiftIntervals(shiftDate, shiftCode)
         : getShiftIntervals();
-    const scans = [];
     const scopeColumnsAvailable = await hasBoxScanScopeColumns();
+    const scans = [];
+    const inMemoryScans = scopeColumnsAvailable
+        ? Array.from(pendingBoxes.values()).flat()
+        : getAllKnownScans();
 
-    for (const scan of getAllKnownScans()) {
+    for (const scan of inMemoryScans) {
         if (
             scan.productionType === selection.productionType &&
             scan.lineCode === selection.lineCode &&
@@ -1090,6 +1093,21 @@ async function getHourlyCountsForResponse(
             }
         } catch (error) {
             console.error('Error reading scoped box scans for HxH:', error);
+            for (const scan of scanHistory) {
+                if (
+                    scan.productionType === selection.productionType &&
+                    scan.lineCode === selection.lineCode &&
+                    scan.scanDate >= shiftInfo.startDate &&
+                    scan.scanDate < shiftInfo.endDate
+                ) {
+                    scans.push({
+                        serial: scan.serial,
+                        boxCode: scan.boxCode,
+                        scanDate: scan.scanDate,
+                        partNumber: scan.partNumber
+                    });
+                }
+            }
         }
     }
 
@@ -1104,6 +1122,17 @@ async function getHourlyCountsForResponse(
         ).length
     }));
 
+    const partCountMap = new Map();
+    for (const scan of scans) {
+        const partNumber = String(
+            scan.partNumber || extractPartNumber(scan.serial) || 'SIN PARTE'
+        ).trim().toUpperCase();
+        partCountMap.set(partNumber, (partCountMap.get(partNumber) || 0) + 1);
+    }
+    const partCounts = Array.from(partCountMap.entries())
+        .sort(([left], [right]) => left.localeCompare(right))
+        .map(([partNumber, count]) => ({ partNumber, count }));
+
     return {
         shiftCode: shiftInfo.shiftCode,
         shift: shiftInfo.shift,
@@ -1115,7 +1144,8 @@ async function getHourlyCountsForResponse(
         lineCode: selection.lineCode,
         legacyRowsExcluded: !scopeColumnsAvailable,
         intervals: counts,
-        total: counts.reduce((sum, interval) => sum + interval.count, 0)
+        total: counts.reduce((sum, interval) => sum + interval.count, 0),
+        partCounts
     };
 }
 
