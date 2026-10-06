@@ -1049,6 +1049,8 @@ async function getHourlyCountsForResponse(
         : getShiftIntervals();
     const scopeColumnsAvailable = await hasBoxScanScopeColumns();
     const scans = [];
+    const dayRange = getCalendarDayRange(shiftInfo.startDate);
+    const dayScans = [];
     const inMemoryScans = scopeColumnsAvailable
         ? Array.from(pendingBoxes.values()).flat()
         : getAllKnownScans();
@@ -1057,14 +1059,22 @@ async function getHourlyCountsForResponse(
         if (
             scan.productionType === selection.productionType &&
             scan.lineCode === selection.lineCode &&
-            scan.scanDate >= shiftInfo.startDate &&
-            scan.scanDate < shiftInfo.endDate
+            scan.scanDate >= dayRange.startDate &&
+            scan.scanDate < dayRange.endDate
         ) {
-            scans.push({
+            const knownScan = {
                 serial: scan.serial,
                 boxCode: scan.boxCode,
-                scanDate: scan.scanDate
-            });
+                scanDate: scan.scanDate,
+                partNumber: scan.partNumber
+            };
+            dayScans.push(knownScan);
+            if (
+                scan.scanDate >= shiftInfo.startDate &&
+                scan.scanDate < shiftInfo.endDate
+            ) {
+                scans.push(knownScan);
+            }
         }
     }
 
@@ -1076,8 +1086,8 @@ async function getHourlyCountsForResponse(
                  WHERE first_scan >= ? AND first_scan < ?
                    AND production_type = ? AND line_code = ?`,
                 [
-                    shiftInfo.startDate,
-                    shiftInfo.endDate,
+                    dayRange.startDate,
+                    dayRange.endDate,
                     selection.productionType,
                     selection.lineCode
                 ]
@@ -1085,11 +1095,18 @@ async function getHourlyCountsForResponse(
 
             for (const row of rows) {
                 const scanDate = parseScanDate(row.first_scan);
-                scans.push({
+                const persistedScan = {
                     serial: row.serial,
                     boxCode: row.box_code,
                     scanDate
-                });
+                };
+                dayScans.push(persistedScan);
+                if (
+                    scanDate >= shiftInfo.startDate &&
+                    scanDate < shiftInfo.endDate
+                ) {
+                    scans.push(persistedScan);
+                }
             }
         } catch (error) {
             console.error('Error reading scoped box scans for HxH:', error);
@@ -1097,15 +1114,22 @@ async function getHourlyCountsForResponse(
                 if (
                     scan.productionType === selection.productionType &&
                     scan.lineCode === selection.lineCode &&
-                    scan.scanDate >= shiftInfo.startDate &&
-                    scan.scanDate < shiftInfo.endDate
+                    scan.scanDate >= dayRange.startDate &&
+                    scan.scanDate < dayRange.endDate
                 ) {
-                    scans.push({
+                    const knownScan = {
                         serial: scan.serial,
                         boxCode: scan.boxCode,
                         scanDate: scan.scanDate,
                         partNumber: scan.partNumber
-                    });
+                    };
+                    dayScans.push(knownScan);
+                    if (
+                        scan.scanDate >= shiftInfo.startDate &&
+                        scan.scanDate < shiftInfo.endDate
+                    ) {
+                        scans.push(knownScan);
+                    }
                 }
             }
         }
@@ -1132,6 +1156,11 @@ async function getHourlyCountsForResponse(
     const partCounts = Array.from(partCountMap.entries())
         .sort(([left], [right]) => left.localeCompare(right))
         .map(([partNumber, count]) => ({ partNumber, count }));
+    const planSummary = await getDailyPlanSummary(
+        selection,
+        dayRange,
+        dayScans
+    );
 
     return {
         shiftCode: shiftInfo.shiftCode,
@@ -1145,8 +1174,100 @@ async function getHourlyCountsForResponse(
         legacyRowsExcluded: !scopeColumnsAvailable,
         intervals: counts,
         total: counts.reduce((sum, interval) => sum + interval.count, 0),
-        partCounts
+        partCounts,
+        plans: planSummary.plans,
+        dailyReleaseTotal: planSummary.dailyReleaseTotal
     };
+}
+
+function getCalendarDayRange(date) {
+    const startDate = new Date(date.getFullYear(), date.getMonth(), date.getDate());
+    return {
+        startDate,
+        endDate: new Date(startDate.getFullYear(), startDate.getMonth(), startDate.getDate() + 1)
+    };
+}
+
+async function getDailyPlanSummary(selection, dayRange, dayScans) {
+    let planRows;
+    try {
+        planRows = await query(
+            `SELECT part_no, plan_count, status
+             FROM mes_production.plan_main
+             WHERE line = ?
+               AND plan_start_date >= ?
+               AND plan_start_date < ?
+             ORDER BY part_no`,
+            [selection.lineCode, dayRange.startDate, dayRange.endDate]
+        );
+    } catch (error) {
+        console.error('Error reading daily production plan:', error);
+        return {
+            plans: [],
+            dailyReleaseTotal: dayScans.length
+        };
+    }
+
+    const planMap = new Map();
+    for (const row of planRows) {
+        const partNumber = String(row.part_no || '').trim().toUpperCase();
+        if (!partNumber) continue;
+
+        const current = planMap.get(partNumber) || {
+            planCount: 0,
+            cancelled: false
+        };
+        current.planCount += Number(row.plan_count || 0);
+        current.cancelled = current.cancelled ||
+            String(row.status || '').trim().toUpperCase() === 'CANCELADO';
+        planMap.set(partNumber, current);
+    }
+
+    const releaseByPart = new Map();
+    for (const scan of dayScans) {
+        const partNumber = String(
+            scan.partNumber || extractPartNumber(scan.serial) || ''
+        ).trim().toUpperCase();
+        if (!partNumber) continue;
+        releaseByPart.set(
+            partNumber,
+            (releaseByPart.get(partNumber) || 0) + 1
+        );
+    }
+
+    const plans = Array.from(planMap.entries())
+        .sort(([left], [right]) => left.localeCompare(right))
+        .map(([partNumber, plan]) => {
+            const releaseCount = plan.cancelled
+                ? 0
+                : releaseByPart.get(partNumber) || 0;
+            let status = 'En plan';
+            if (plan.cancelled) {
+                status = 'CANCELA';
+            } else if (releaseCount >= plan.planCount) {
+                status = 'Terminado';
+            } else if (releaseCount > 0) {
+                status = 'En proceso';
+            }
+
+            return {
+                partNumber,
+                planCount: plan.planCount,
+                status,
+                releaseCount
+            };
+        });
+
+    const cancelledParts = new Set(
+        plans
+            .filter((plan) => plan.status === 'CANCELA')
+            .map((plan) => plan.partNumber)
+    );
+    const dailyReleaseTotal = Array.from(releaseByPart.entries())
+        .filter(([partNumber]) => !cancelledParts.has(partNumber))
+        .reduce((total, [, count]) => total + count, 0);
+
+    return { plans, dailyReleaseTotal };
 }
 
 function parseRequestedShiftDate(value) {
