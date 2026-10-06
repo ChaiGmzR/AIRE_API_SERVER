@@ -1215,9 +1215,11 @@ async function getDailyPlanSummary(selection, dayRange, dayScans) {
 
         const current = planMap.get(partNumber) || {
             planCount: 0,
-            cancelled: false
+            cancelled: false,
+            hasPlan: false
         };
         current.planCount += Number(row.plan_count || 0);
+        current.hasPlan = true;
         current.cancelled = current.cancelled ||
             String(row.status || '').trim().toUpperCase() === 'CANCELADO';
         planMap.set(partNumber, current);
@@ -1235,14 +1237,25 @@ async function getDailyPlanSummary(selection, dayRange, dayScans) {
         );
     }
 
-    const plans = Array.from(planMap.entries())
-        .sort(([left], [right]) => left.localeCompare(right))
-        .map(([partNumber, plan]) => {
+    const partNumbers = new Set([
+        ...planMap.keys(),
+        ...releaseByPart.keys()
+    ]);
+    const plans = Array.from(partNumbers)
+        .sort((left, right) => left.localeCompare(right))
+        .map((partNumber) => {
+            const plan = planMap.get(partNumber) || {
+                planCount: 0,
+                cancelled: false,
+                hasPlan: false
+            };
             const releaseCount = plan.cancelled
                 ? 0
                 : releaseByPart.get(partNumber) || 0;
             let status = 'En plan';
-            if (plan.cancelled) {
+            if (!plan.hasPlan) {
+                status = 'Sin plan';
+            } else if (plan.cancelled) {
                 status = 'CANCELA';
             } else if (releaseCount >= plan.planCount) {
                 status = 'Terminado';
