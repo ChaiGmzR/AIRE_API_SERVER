@@ -1237,6 +1237,8 @@ async function getDailyPlanSummary(selection, dayRange, dayScans) {
         );
     }
 
+    const latestScannedPart = getLatestScannedPartNumber(dayScans);
+
     const partNumbers = new Set([
         ...planMap.keys(),
         ...releaseByPart.keys()
@@ -1260,7 +1262,9 @@ async function getDailyPlanSummary(selection, dayRange, dayScans) {
             } else if (releaseCount >= plan.planCount) {
                 status = 'Terminado';
             } else if (releaseCount > 0) {
-                status = 'En proceso';
+                status = partNumber === latestScannedPart
+                    ? 'En proceso'
+                    : 'Pausa';
             }
 
             return {
@@ -1281,6 +1285,30 @@ async function getDailyPlanSummary(selection, dayRange, dayScans) {
         .reduce((total, [, count]) => total + count, 0);
 
     return { plans, dailyReleaseTotal };
+}
+
+function getLatestScannedPartNumber(scans) {
+    let latestScan = null;
+    let latestTimestamp = Number.NEGATIVE_INFINITY;
+
+    for (const scan of scans) {
+        const scanDate = scan.scanDate instanceof Date
+            ? scan.scanDate
+            : new Date(scan.scanDate);
+        const timestamp = scanDate.getTime();
+        if (!Number.isFinite(timestamp) || timestamp < latestTimestamp) {
+            continue;
+        }
+
+        latestTimestamp = timestamp;
+        latestScan = scan;
+    }
+
+    if (!latestScan) return '';
+
+    return String(
+        latestScan.partNumber || extractPartNumber(latestScan.serial) || ''
+    ).trim().toUpperCase();
 }
 
 function parseRequestedShiftDate(value) {
